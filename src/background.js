@@ -68,7 +68,7 @@ async function handleMessage(message) {
     case core.MESSAGE_TYPES.SCAN_WATCHLATER:
       return scanWatchlater(message);
     case core.MESSAGE_TYPES.UPSERT_VIDEO_ITEMS:
-      return upsertVideoItems(message.items || [], { markRemoved: false });
+      return scanWatchlater({ domItems: message.items || [], skipAutoClassify: true });
     case core.MESSAGE_TYPES.FETCH_VIDEO_DETAILS:
       return queueMissingVideoDetails();
     case core.MESSAGE_TYPES.EXPORT_CATEGORY_PROPOSAL:
@@ -558,8 +558,9 @@ async function scanWatchlater(message) {
   }
 
   const domItems = Array.isArray(message.domItems) ? message.domItems : [];
+  const trustedItems = apiSucceeded ? apiItems : domItems;
   const itemsByBvid = new Map();
-  [...apiItems, ...domItems].forEach((item) => {
+  trustedItems.forEach((item) => {
     const bvid = core.normalizeBvid(item && (item.bvid || item.pageUrl));
     if (!bvid) return;
     itemsByBvid.set(bvid, Object.assign({}, itemsByBvid.get(bvid) || {}, item, { bvid, presentInWatchlater: true }));
@@ -912,7 +913,7 @@ async function processDetailJob(job) {
   await db.updateJob(job.id, { status: "running", attempts: (job.attempts || 0) + 1 });
   try {
     const details = await fetchVideoDetails(job.bvid);
-    await db.upsertVideos([Object.assign({}, details, { bvid: job.bvid, presentInWatchlater: true })]);
+    await db.upsertVideos([Object.assign({}, details, { bvid: job.bvid })]);
     await db.updateJob(job.id, { status: "done", error: "" });
     setProgress({ done: progress.done + 1 });
   } catch (error) {
@@ -954,8 +955,7 @@ async function fetchVideoDetails(bvid) {
     duration: data.duration,
     viewCount: data.stat && data.stat.view,
     pubdate: data.pubdate || data.ctime,
-    pageParts: Array.isArray(data.pages) ? data.pages.map((page) => page.part).filter(Boolean) : [],
-    presentInWatchlater: true
+    pageParts: Array.isArray(data.pages) ? data.pages.map((page) => page.part).filter(Boolean) : []
   };
 }
 
@@ -999,8 +999,7 @@ async function fetchVideoDetailsFromHtml(bvid) {
     coverUrl: videoData && videoData.pic,
     duration: videoData && videoData.duration,
     viewCount: videoData && videoData.stat && videoData.stat.view,
-    pubdate: videoData && (videoData.pubdate || videoData.ctime),
-    presentInWatchlater: true
+    pubdate: videoData && (videoData.pubdate || videoData.ctime)
   };
 }
 

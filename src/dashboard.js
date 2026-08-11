@@ -14,6 +14,7 @@
     progress: null
   };
   let activeFilter = { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" };
+  let videoFilter = "";
   let searchText = "";
   let selectedBvid = "";
   let categoryAdminOpen = false;
@@ -620,6 +621,7 @@
       el("div", { className: "topbar" }, [
         el("input", { className: "search-input", type: "search", value: searchText, placeholder: "搜索标题、UP主、分区、标签、BV号", dataset: { role: "search" } }),
         el("div", { className: "toolbar" }, [
+          el("select", { title: "筛选视频", dataset: { role: "video-filter" } }, videoFilterOptions()),
           el("select", { title: "排序", dataset: { role: "sort-combo" } }, sortOptions()),
           el("button", { className: "primary", title: "先同步列表，再排队更新缺失详情", dataset: { action: "sync-refresh" }, textContent: "同步并更新" }),
           toolbarIconButton("open-bili-home", "B站主页", "bilibili"),
@@ -1771,7 +1773,10 @@
 
   function onChange(event) {
     const role = event.target.dataset.role;
-    if (role === "sort-combo") {
+    if (role === "video-filter") {
+      videoFilter = event.target.value;
+      renderShell();
+    } else if (role === "sort-combo") {
       const parsed = parseSortCombo(event.target.value);
       send({ type: message.UPDATE_SETTINGS, settings: parsed })
         .then(updateState)
@@ -2642,29 +2647,34 @@
   }
 
   async function removeFromWatchlater(bvid) {
-    const video = state.videos.find((item) => item.bvid === bvid);
+    const videoIndex = state.videos.findIndex((item) => item.bvid === bvid);
+    const video = state.videos[videoIndex];
     if (!video) return;
-    const confirmed = await confirmAction({
-      title: "移出稍后再看？",
-      message: "「" + core.truncateText(video.title || bvid, 58) + "」\n本地分类记录会保留。",
-      confirmLabel: "移出"
-    });
-    if (!confirmed) return;
-    setStatus("正在从稍后再看移除：" + bvid);
+    const previousVideo = Object.assign({}, video);
+    video.presentInWatchlater = false;
+    selectedBvids.delete(bvid);
+    if (selectedBvid === bvid) {
+      const first = visibleVideos()[0] || presentVideos()[0];
+      selectedBvid = first ? first.bvid : "";
+    }
+    renderShell();
+    setStatus("已从列表移除，正在向 B站确认：" + core.truncateText(video.title || bvid, 30));
     try {
       const result = await send({
         type: message.REMOVE_FROM_WATCHLATER,
         bvid
       });
       updateState(result);
-      if (selectedBvid === bvid) {
-        const first = visibleVideos()[0] || presentVideos()[0];
-        selectedBvid = first ? first.bvid : "";
-        renderShell();
-      }
-      setStatus("已移出稍后再看：" + bvid);
+      setStatus("B站已确认移出：" + core.truncateText(video.title || bvid, 30));
     } catch (error) {
-      setStatus("移出稍后失败：" + error.message);
+      const current = state.videos.find((item) => item.bvid === bvid);
+      if (current) {
+        current.presentInWatchlater = true;
+      } else {
+        state.videos.splice(Math.max(0, videoIndex), 0, previousVideo);
+      }
+      renderShell();
+      setStatus("移出失败，视频已恢复：" + error.message);
     }
   }
 
@@ -2688,12 +2698,11 @@
     const classifications = classificationMap();
     const query = core.normalizeText(searchText).toLowerCase();
     return presentVideos()
-      .filter((video) => {
-        if (activeFilter.includeUnclassified) {
-          return core.needsLlmExport(video, classifications.get(video.bvid));
-        }
-        return core.matchesFilter(video, classifications.get(video.bvid), activeFilter);
-      })
+      .filter((video) => core.matchesFilter(
+        video,
+        classifications.get(video.bvid),
+        Object.assign({}, activeFilter, { videoFilter })
+      ))
       .filter((video) => {
         if (!query) return true;
         const haystack = [
@@ -2841,14 +2850,35 @@
   }
 
   function activeFilterLabel() {
-    if (activeFilter.includeUnclassified) return "筛选：待精细分类";
-    if (!activeFilter.categoryIds.length) return "筛选：全部";
-    const ids = activeFilter.sourceCategoryId ? [activeFilter.sourceCategoryId] : activeFilter.categoryIds;
-    const names = ids
-      .map((id) => state.categories.find((category) => category.id === id))
-      .filter(Boolean)
-      .map((category) => category.name);
-    return "筛选：" + names.slice(0, 3).join("、") + (names.length > 3 ? " 等" : "");
+    let categoryText = "全部";
+    if (activeFilter.includeUnclassified) {
+      categoryText = "待精细分类";
+    } else if (activeFilter.categoryIds.length) {
+      const ids = activeFilter.sourceCategoryId ? [activeFilter.sourceCategoryId] : activeFilter.categoryIds;
+      const names = ids
+        .map((id) => state.categories.find((category) => category.id === id))
+        .filter(Boolean)
+        .map((category) => category.name);
+      categoryText = names.slice(0, 3).join("、") + (names.length > 3 ? " 等" : "");
+    }
+    const videoText = videoFilterOptionsData().find((item) => item.value === videoFilter);
+    return "筛选：" + categoryText + (videoText && videoText.value ? " · " + videoText.label : "");
+  }
+
+  function videoFilterOptionsData() {
+    return [
+      { value: "", label: "全部时长" },
+      { value: "duration-120", label: "2分钟以内" },
+      { value: "duration-300", label: "5分钟以内" },
+      { value: "duration-600", label: "10分钟以内" },
+      { value: "duration-1800", label: "30分钟以内" },
+      { value: "duration-3600-plus", label: "1小时以上" },
+      { value: "partially-played", label: "部分播放" }
+    ];
+  }
+
+  function videoFilterOptions() {
+    return videoFilterOptionsData().map((item) => option(item.value, item.label, videoFilter));
   }
 
   function statusText() {

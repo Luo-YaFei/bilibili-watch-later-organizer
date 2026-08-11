@@ -46,7 +46,7 @@ function loadBackgroundHelpers() {
 test("extension version is consistent across manifests", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(core.EXTENSION_VERSION, "1.1.3");
+  assert.equal(core.EXTENSION_VERSION, "1.2.0");
   assert.equal(manifest.version, core.EXTENSION_VERSION);
   assert.equal(pkg.version, core.EXTENSION_VERSION);
 });
@@ -318,6 +318,32 @@ test("matchesFilter handles unclassified and category filters", () => {
   assert.equal(core.matchesFilter(video, { categoryIds: ["tech.ai.llm"] }, { categoryIds: ["life.food"] }), false);
 });
 
+test("matchesFilter supports duration thresholds and partially played videos", () => {
+  const short = { bvid: "BV1aa411c7mA", presentInWatchlater: true, duration: 120, watchProgress: 0 };
+  const medium = { bvid: "BV1bb411c7mB", presentInWatchlater: true, duration: 301, watchProgress: 125, isWatched: false };
+  const long = { bvid: "BV1cc411c7mC", presentInWatchlater: true, duration: 3600, watchProgress: 3600, isWatched: true };
+  assert.equal(core.matchesFilter(short, null, { videoFilter: "duration-120" }), true);
+  assert.equal(core.matchesFilter(medium, null, { videoFilter: "duration-300" }), false);
+  assert.equal(core.matchesFilter(medium, null, { videoFilter: "duration-600" }), true);
+  assert.equal(core.matchesFilter(long, null, { videoFilter: "duration-3600-plus" }), true);
+  assert.equal(core.matchesFilter(medium, null, { videoFilter: "partially-played" }), true);
+  assert.equal(core.matchesFilter(long, null, { videoFilter: "partially-played" }), false);
+});
+
+test("detail-only canonicalization preserves removed watchlater membership", () => {
+  const removed = core.canonicalizeVideo({
+    bvid: "BV1dd411c7mD",
+    title: "已移除",
+    presentInWatchlater: false
+  });
+  const detailed = core.canonicalizeVideo({
+    bvid: removed.bvid,
+    desc: "补充详情",
+    duration: 600
+  }, removed);
+  assert.equal(detailed.presentInWatchlater, false);
+});
+
 test("categoryIdFromName creates stable ids under parent", () => {
   assert.equal(core.categoryIdFromName("", "研究", core.DEFAULT_CATEGORIES), "研究");
   const id = core.categoryIdFromName("entertainment", "个人影单", core.DEFAULT_CATEGORIES);
@@ -506,6 +532,9 @@ test("background scan only fills unclassified videos and does not auto queue det
   const scanSource = source.slice(scanStart, upsertStart);
   const upsertSource = source.slice(upsertStart, detailQueueStart);
   assert.match(scanSource, /autoClassify\(\{ silent: true, unclassifiedOnly: true \}\)/);
+  assert.match(scanSource, /const trustedItems = apiSucceeded \? apiItems : domItems/);
+  assert.match(scanSource, /trustedItems\.forEach/);
+  assert.equal(scanSource.includes("[...apiItems, ...domItems]"), false);
   assert.equal(scanSource.includes("queueMissingVideoDetails("), false);
   assert.equal(upsertSource.includes("queueJobs("), false);
   assert.match(source, /FETCH_VIDEO_DETAILS:[\s\S]*?queueMissingVideoDetails\(\)/);
@@ -593,6 +622,7 @@ test("watchlater removal wiring is exposed in manifest background dashboard and 
   assert.match(background, /B站删除\|HTTP 412/);
   assert.match(content, /REMOVE_FROM_WATCHLATER_PAGE/);
   assert.match(content, /removeFromWatchlaterOnPage/);
+  assert.match(content, /card === link \|\| !card\.querySelector \|\| !card\.querySelector\("img"\)/);
   assert.equal(background.includes("csrf_token"), false);
   assert.match(dashboard, /remove-watchlater/);
   assert.match(dashboard, /watchlaterPlaybackUrl/);
@@ -600,8 +630,10 @@ test("watchlater removal wiring is exposed in manifest background dashboard and 
   assert.match(dashboard, /batchMode \? renderCover\(video\) : el\("a"/);
   assert.match(dashboard, /title: "移出稍后再看"/);
   assert.match(dashboard, /"aria-label": "移出稍后再看"/);
-  assert.match(dashboard, /confirmAction\(\{/);
-  assert.match(dashboard, /title: "移出稍后再看？"/);
+  assert.match(dashboard, /video\.presentInWatchlater = false/);
+  assert.match(dashboard, /已从列表移除，正在向 B站确认/);
+  assert.match(dashboard, /移出失败，视频已恢复/);
+  assert.equal(dashboard.includes('title: "移出稍后再看？"'), false);
   assert.match(dashboard, /title: "删除分类？"/);
   assert.match(dashboard, /iconNode\("trash"\)/);
   assert.match(dashboard, /textContent: category\.name \|\| category\.id/);

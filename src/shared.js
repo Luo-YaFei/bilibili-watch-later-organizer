@@ -1,7 +1,7 @@
 (function attachBiliWatchLaterCore(root) {
   "use strict";
 
-  const EXTENSION_VERSION = "1.1.3";
+  const EXTENSION_VERSION = "1.2.0";
   const CLASSIFIER_VERSION = "manual-llm-json-v1";
   const LOCAL_CLASSIFIER_VERSION = "local-rules-v1";
   const CLASSIFICATION_SOURCE_TYPES = Object.freeze({
@@ -279,7 +279,11 @@
     merged.watchlaterAddedAt = pickUseful(toNumberOrUndefined(input && input.watchlaterAddedAt), merged.watchlaterAddedAt);
     merged.watchlaterOrder = pickUseful(toNumberOrUndefined(input && input.watchlaterOrder), merged.watchlaterOrder);
     merged.pageParts = pickUseful(uniqueStrings(input && input.pageParts), merged.pageParts) || [];
-    merged.presentInWatchlater = input && input.presentInWatchlater === false ? false : true;
+    if (input && Object.prototype.hasOwnProperty.call(input, "presentInWatchlater")) {
+      merged.presentInWatchlater = input.presentInWatchlater !== false;
+    } else if (!existing || typeof existing.presentInWatchlater !== "boolean") {
+      merged.presentInWatchlater = true;
+    }
     merged.firstSeenAt = existing && existing.firstSeenAt ? existing.firstSeenAt : now;
     merged.lastSeenAt = now;
     merged.sourceHash = computeSourceHash(merged);
@@ -948,6 +952,15 @@
     const settings = filter || {};
     if (!video) return false;
     if (video.presentInWatchlater === false && !settings.includeRemoved) return false;
+
+    const duration = Number(video.duration) || 0;
+    const watchProgress = Number(video.watchProgress) || 0;
+    if (settings.videoFilter === "duration-120" && !(duration > 0 && duration <= 120)) return false;
+    if (settings.videoFilter === "duration-300" && !(duration > 0 && duration <= 300)) return false;
+    if (settings.videoFilter === "duration-600" && !(duration > 0 && duration <= 600)) return false;
+    if (settings.videoFilter === "duration-1800" && !(duration > 0 && duration <= 1800)) return false;
+    if (settings.videoFilter === "duration-3600-plus" && duration < 3600) return false;
+    if (settings.videoFilter === "partially-played" && !(watchProgress > 0 && video.isWatched !== true && (duration <= 0 || watchProgress < duration))) return false;
 
     const categoryIds = new Set(settings.categoryIds || []);
     const hasCategoryFilter = categoryIds.size > 0;

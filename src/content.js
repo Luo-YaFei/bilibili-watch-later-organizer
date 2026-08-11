@@ -201,8 +201,7 @@
     syncInFlight = true;
     try {
       setStatus(options.fullScan ? "正在扫描列表..." : "正在同步可见视频...");
-      const type = options.fullScan ? message.SCAN_WATCHLATER : message.UPSERT_VIDEO_ITEMS;
-      const response = await send({ type, domItems, items: domItems });
+      const response = await send({ type: message.SCAN_WATCHLATER, domItems });
       updateState(response);
     } finally {
       syncInFlight = false;
@@ -310,6 +309,7 @@
       const bvid = core.extractBvid(link.href || link.getAttribute("href") || "");
       if (!bvid || itemsByBvid.has(bvid)) return;
       const card = closestVideoCard(link);
+      if (!card || card === link || !card.querySelector || !card.querySelector("img")) return;
       itemsByBvid.set(bvid, {
         bvid,
         title: findTitle(link, card) || bvid,
