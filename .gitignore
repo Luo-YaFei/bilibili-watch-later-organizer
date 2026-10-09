@@ -24,3 +24,9 @@ web-ext-artifacts/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local investigation and visual preview files
+/docs/watchlater-delete-investigation.md
+/tests/toolbar-preview.html
+/test-results/
+/playwright-report/

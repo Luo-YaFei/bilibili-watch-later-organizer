@@ -2,7 +2,13 @@
 
 **Extension:** Bilibili Watch Later Organizer
 **Effective date:** July 11, 2026
-**Last updated:** July 11, 2026
+**Last updated:** October 9, 2026
+
+## AI service update / AI 服务更新
+
+The AI service provisions below also apply to the selected OpenAI-compatible provider and TypeSafe (Jev), rather than only OpenRouter. Their keys are stored separately in local extension storage. Jev requests go directly to `https://api.typesafe.ai/v1/systemone`, with the TypeSafe key used only for authentication. Classification sends video titles, uploader names, Bilibili sections, tags, descriptions, part titles, and category paths/keywords. No Bilibili cookies are sent to TypeSafe. The API test sends a built-in sample instead of your videos. TypeSafe's own terms and privacy policy apply: https://docs.typesafe.ai/legal . To revoke a Jev key, use your TypeSafe account.
+
+下文关于 AI 服务的条款同样适用于用户选择的 OpenAI-compatible 服务和 TypeSafe（Jev），不只限于 OpenRouter。两类密钥分别保存在扩展本地存储中。Jev 请求直接发送至 `https://api.typesafe.ai/v1/systemone`，TypeSafe 密钥仅用于认证。视频分类会发送标题、UP 主、B站分区、标签、简介、分P标题以及分类路径和关键词，不发送 B站 Cookie。API 测试发送内置示例，不发送用户的视频。TypeSafe 的条款和隐私政策见 https://docs.typesafe.ai/legal 。如需撤销 Jev 密钥，请在 TypeSafe 账户中操作。
 
 ---
 
@@ -58,7 +64,7 @@ When the user actively starts an AI classification operation, the Extension may 
 * Classification instructions required to produce a result
 * The user-provided OpenRouter API key for request authentication
 
-This information is sent only after the user initiates the AI feature. The Extension does not automatically send the user’s Watch Later list to OpenRouter in the background.
+This information is sent when the user initiates AI classification or explicitly enables scheduled/threshold-based automatic classification. Automatic classification may run in the background using the selected service. Disable automatic classification and remove the saved key to stop further automatic requests.
 
 The information is sent to OpenRouter for the sole purpose of generating video classification suggestions or category recommendations.
 
@@ -257,7 +263,7 @@ AI 辅助分类功能完全可选。
 * 生成分类结果所需的指令
 * 用户自行提供的 OpenRouter API Key，用于请求身份验证
 
-只有在用户主动启动 AI 功能后，相关信息才会被发送。本扩展不会在后台自动上传用户的稍后再看列表。
+只有在用户主动启动 AI 分类，或明确开启每天、每周、按数量自动分类后，相关信息才会发送给所选服务。自动分类可在后台运行；关闭自动分类并删除保存的密钥可停止后续自动请求。
 
 相关信息仅用于生成视频分类建议或分类目录建议。
 

@@ -57,15 +57,6 @@
         setStatus(payload.progress.message || "正在同步视频信息…");
         return false;
       }
-      if (payload && payload.type === message.REMOVE_FROM_WATCHLATER_PAGE) {
-        removeFromWatchlaterOnPage(payload)
-          .then((result) => sendResponse({ ok: true, data: result }))
-          .catch((error) => sendResponse({
-            ok: false,
-            error: error && error.message ? error.message : String(error)
-          }));
-        return true;
-      }
       return false;
     });
   }
@@ -206,31 +197,6 @@
     } finally {
       syncInFlight = false;
     }
-  }
-
-  async function removeFromWatchlaterOnPage(payload) {
-    const aid = Number(payload && payload.aid);
-    const csrf = core.normalizeText(payload && payload.csrf);
-    if (!Number.isFinite(aid) || aid <= 0) throw new Error("页面删除缺少 aid");
-    if (!csrf) throw new Error("页面删除缺少 csrf");
-    const body = new URLSearchParams();
-    body.set("aid", String(aid));
-    body.set("csrf", csrf);
-    const response = await fetch("https://api.bilibili.com/x/v2/history/toview/del", {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        "accept": "application/json,text/plain,*/*",
-        "content-type": "application/x-www-form-urlencoded;charset=UTF-8"
-      },
-      body: body.toString()
-    });
-    if (!response.ok) throw new Error("B站页面删除接口 HTTP " + response.status);
-    const json = await response.json();
-    if (!json || json.code !== 0) {
-      throw new Error("B站页面删除失败：" + (json && json.message ? json.message : "code " + (json && json.code)));
-    }
-    return { aid, bvid: core.normalizeBvid(payload && payload.bvid) };
   }
 
   function scheduleLightSync(delay) {

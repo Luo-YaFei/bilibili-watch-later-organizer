@@ -16,32 +16,52 @@
   let activeFilter = { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" };
   let videoFilter = "";
   let searchText = "";
+  let randomOrder = null;
+  let searchTimer = 0;
+  let searchComposing = false;
+  let sortRequest = 0;
+  let resultTransition = null;
+  let resultExitLayer = null;
+  const auraCleanup = new WeakMap();
   let selectedBvid = "";
-  let categoryAdminOpen = false;
+  let settingsPage = "classify";
+  let aiMethod = "api";
+  let directoryMode = "edit";
+  let categoryAddOpen = false;
+  let noticeLayoutObserver = null;
+  let preferencesPage = "api";
+  let settingsScrollTops = new Map();
+  let llmFormDraft = {};
+  let newCategoryDraft = { name: "", parent: "" };
   let categoryDraft = null;
   let categoryDraftDirty = false;
   let exchange = { visible: false, title: "", text: "", append: false, mode: "import" };
   let savedCategoryScrollTop = 0;
-  let draggedCategoryId = "";
-  let dragDropPosition = "before";
-  let suppressCategoryClick = false;
+  let categoryLoopObserver = null;
   let batchMode = false;
   let selectedBvids = new Set();
-  let batchCategoryId = "";
+  let pendingRemovalBvids = new Set();
+  let confirmedRemovalBvids = new Set();
+  let batchCategoryIds = new Set();
   let selectionBox = null;
   let suppressNextCardClick = false;
   let llmRun = { running: false, stopRequested: false, done: false, imported: 0, skipped: 0, processed: 0, total: 0, message: "" };
   let manualEditorOpen = false;
-  let llmPanelOpen = false;
-  let settingsPanelOpen = false;
-  let apiSettingsOpen = false;
-  let autoApiSettingsOpen = false;
+  let managementOpen = false;
+  let manualCategoryDraft = null;
+  let noticeExpiresAt = 0;
+  let noticeTimer = 0;
+  let operationLogs = [];
+  let operationLogError = "";
+  const OPERATION_LOG_KEY = "biliwl.operationLog";
+  const OPERATION_LOG_LIMIT = 200;
   let apiSettingsDraft = null;
   let autoApiSettingsDraft = null;
   let apiTestState = { running: false, message: "" };
   let categoryGeneration = { mode: "", running: false, loading: false, prompt: "", importText: "", message: "" };
   let syncAnimations = { added: new Set(), changed: new Set() };
   let syncAnimationTimer = 0;
+  let syncAnimationStartedAt = 0;
   let idleDetailTimer = 0;
   let lastIdleDetailRefreshAt = 0;
   let onboardingCheckingLogin = false;
@@ -60,18 +80,43 @@
   init();
 
   function init() {
+    operationLogs = readOperationLogs();
+    window.addEventListener("storage", (event) => {
+      if (event.key !== OPERATION_LOG_KEY && event.key !== null) return;
+      operationLogs = readOperationLogs();
+      updateOperationLogSurface();
+    });
     app.addEventListener("click", onClick);
+    app.addEventListener("keydown", onModalKeyDown);
+    app.addEventListener("cancel", (event) => {
+      if (!event.target.matches(".management-dialog")) return;
+      event.preventDefault();
+      closeModal();
+    }, true);
+    app.addEventListener("pointerover", onCategoryPreview);
+    app.addEventListener("pointerout", onCategoryPreview);
+    app.addEventListener("focusin", onCategoryPreview);
+    app.addEventListener("focusout", onCategoryPreview);
+    document.addEventListener("pointermove", reconcileCategoryPointer);
+    document.addEventListener("pointerup", reconcileCategoryPointer);
+    document.addEventListener("pointercancel", clearCategoryPreviews);
+    window.addEventListener("blur", clearCategoryPreviews);
+    document.addEventListener("visibilitychange", () => { if (document.hidden) clearCategoryPreviews(); });
+    app.addEventListener("compositionstart", (event) => {
+      if (event.target.dataset.role === "search") { searchComposing = true; clearTimeout(searchTimer); }
+    });
+    app.addEventListener("compositionend", (event) => {
+      if (event.target.dataset.role === "search") { searchComposing = false; onInput(event); }
+    });
     app.addEventListener("input", onInput);
     app.addEventListener("change", onChange);
-    app.addEventListener("dragstart", onDragStart);
-    app.addEventListener("dragover", onDragOver);
-    app.addEventListener("drop", onDrop);
-    app.addEventListener("dragend", onDragEnd);
     app.addEventListener("pointerdown", onPointerDown);
     app.addEventListener("pointermove", onPointerMove);
     app.addEventListener("pointerup", onPointerUp);
     app.addEventListener("pointercancel", onPointerUp);
     app.addEventListener("scroll", onSelectionScroll, true);
+    app.addEventListener("scroll", positionStatusNotice, true);
+    window.addEventListener("resize", positionStatusNotice);
     app.addEventListener("wheel", onWheel, { passive: false });
     chrome.runtime.onMessage.addListener((payload) => {
       if (payload && payload.type === message.JOB_PROGRESS) {
@@ -176,17 +221,19 @@
     return response.data;
   }
 
-  function updateState(nextState) {
+  function updateState(nextState, renderOptions) {
     if (nextState && nextState.categories && !categoryDraftDirty) categoryDraft = null;
-    state = Object.assign({}, state, nextState || {});
+    const mergedState = Object.assign({}, state, nextState || {});
+    if ((pendingRemovalBvids.size || confirmedRemovalBvids.size) && Array.isArray(mergedState.videos)) {
+      mergedState.videos = mergedState.videos.map((video) => pendingRemovalBvids.has(video.bvid) || confirmedRemovalBvids.has(video.bvid)
+        ? Object.assign({}, video, { presentInWatchlater: false })
+        : video);
+    }
+    state = mergedState;
     if (selectedBvid && !presentVideos().some((video) => video.bvid === selectedBvid)) {
       selectedBvid = "";
     }
-    if (!selectedBvid) {
-      const first = visibleVideos()[0] || state.videos.find((video) => video.presentInWatchlater !== false);
-      selectedBvid = first ? first.bvid : "";
-    }
-    renderShell();
+    renderShell(renderOptions);
   }
 
   function onboardingActive() {
@@ -206,7 +253,11 @@
   }
 
   async function updateStateWithSyncAnimation(nextState, scanResult) {
+    releaseConfirmedRemovals(nextState);
     const delta = syncDelta(scanResult);
+    const previousIds = new Set(presentVideos().map((video) => video.bvid));
+    const incoming = (nextState && nextState.videos || []).filter((video) => video.presentInWatchlater !== false);
+    delta.added = [...new Set(delta.added.concat(incoming.filter((video) => !previousIds.has(video.bvid)).map((video) => video.bvid)))];
     if (delta.removed.length) {
       delta.removed.forEach((bvid) => {
         const card = videoCardByBvid(bvid);
@@ -218,8 +269,18 @@
       added: new Set(delta.added),
       changed: new Set(delta.changed.filter((bvid) => !delta.added.includes(bvid)))
     };
-    updateState(nextState);
+    syncAnimationStartedAt = Date.now();
+    updateState(nextState, { animateCards: delta.removed.length > 0 || delta.added.length > 0 });
     scheduleClearSyncAnimations();
+  }
+
+  function releaseConfirmedRemovals(nextState) {
+    if (!confirmedRemovalBvids.size || !nextState || !Array.isArray(nextState.videos)) return;
+    const videosByBvid = new Map(nextState.videos.map((video) => [video.bvid, video]));
+    confirmedRemovalBvids.forEach((bvid) => {
+      const video = videosByBvid.get(bvid);
+      if (!video || video.presentInWatchlater === false) confirmedRemovalBvids.delete(bvid);
+    });
   }
 
   function syncDelta(scanResult) {
@@ -250,20 +311,66 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  function renderShell() {
+  function renderShell({ animateCards = false, reflowDuration = 280 } = {}) {
+    // Preserve the currently visible position even if another deletion interrupts a reflow.
+    const previousCards = animateCards || document.querySelector(".video-card[data-reflow]")
+      ? captureCardPositions() : null;
+    const modalFocus = captureModalFocus();
+    captureModalDraft();
+    rememberSettingsScroll();
     rememberScrollPositions();
     const visible = visibleVideos();
     const children = [el("div", { className: "app" + (batchMode ? " batch-mode" : "") }, [
       renderSidebar(),
-      renderMain(visible),
-      renderEditor(visible)
+      renderMain(visible)
     ])];
+    children.push(renderEditor(), renderStatusNotice());
     const banner = renderOnboardingBanner();
     const overlay = renderOnboardingOverlay();
     if (banner) children.push(banner);
     if (overlay) children.push(overlay);
     app.replaceChildren(...children);
     restoreScrollPositions();
+    observeStatusPosition();
+    showModal();
+    restoreModalFocus(modalFocus);
+    updateStatusSurface();
+    ensureCategoryGlass();
+    globalThis.BiliWLAura.refresh();
+    if (previousCards) animateCardReflow(previousCards, reflowDuration);
+    resumeResultTransition(document.querySelector('[data-role="content"]'));
+  }
+
+  function captureCardPositions() {
+    return new Map(Array.from(document.querySelectorAll(".video-card[data-bvid]"), (card) => [
+      card.dataset.bvid, card.getBoundingClientRect()
+    ]));
+  }
+
+  function animateCardReflow(previousCards, duration = 280) {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const main = document.querySelector(".main");
+    if (!main) return;
+    const viewport = main.getBoundingClientRect();
+    // Read all positions before starting animations to avoid repeated layout work.
+    const moves = Array.from(document.querySelectorAll(".video-card[data-bvid]"), (card) => ({
+      card, before: previousCards.get(card.dataset.bvid), after: card.getBoundingClientRect()
+    }));
+    moves.forEach(({ card, before, after }) => {
+      if (!before) return;
+      const top = Math.max(0, viewport.top);
+      const bottom = Math.min(window.innerHeight, viewport.bottom);
+      if ((before.bottom < top || before.top > bottom) && (after.bottom < top || after.top > bottom)) return;
+      const dx = before.left - after.left;
+      const dy = before.top - after.top;
+      if (Math.abs(dx) < .5 && Math.abs(dy) < .5) return;
+      card.dataset.reflow = "true";
+      const animation = card.animate([
+        { transform: "translate(" + dx + "px, " + dy + "px)" },
+        { transform: "translate(0, 0)" }
+      ], { duration, easing: "cubic-bezier(.2, .75, .25, 1)" });
+      animation.finished.then(() => { delete card.dataset.reflow; }, () => { delete card.dataset.reflow; });
+    });
   }
 
   function renderOnboardingOverlay() {
@@ -293,7 +400,7 @@
         el("p", { textContent: "这里调整的是所有视频共用的分类目录，不是在给视频分配类别。默认目录不一定适合你，可以手动修改，也可以让 AI 根据现有视频重新生成。" }),
         renderOnboardingCategoryPreview("当前分类目录"),
         el("div", { className: "onboarding-options" }, [
-          onboardingOption("categories", "1", "我要手动设置我的分类", "收起引导卡片并展开右侧的编辑分类目录，直接修改可选分类。"),
+          onboardingOption("categories", "1", "我要手动设置我的分类", "收起引导卡片并展开设置弹窗中的编辑分类目录，直接修改可选分类。"),
           onboardingOption("api", "2", "我有 API，让 AI 帮我调整分类", "填写 API 后，AI 会根据现有视频自动生成并替换分类目录。"),
           onboardingOption("prompt", "3", "我没有 API，手动复制 Prompt 来生成分类目录", "复制分类目录 Prompt 给 AI，再把 categories JSON 导回插件。")
         ]),
@@ -301,13 +408,13 @@
       ];
     } else if (stage === "setup-api") {
       const settings = state.settings || {};
-      const configured = apiSettingsReady(settings);
+      const configured = categoryApiSettingsReady(settings);
       content = [
         el("div", { className: "onboarding-kicker", textContent: "首次使用 · 2 / 3 · API" }),
         el("h2", { textContent: "让 AI 生成分类目录" }),
-        el("p", { textContent: "分类目录生成和 AI 批量视频分类共用同一组 API 设置。生成目录本身不会给每个视频分类。" }),
-        el("div", { className: "onboarding-api-state " + (configured ? "ready" : "missing"), textContent: configured ? "API 已设置，可以先测试，或直接生成分类目录。" : "API 尚未设置完整，请先到右侧“设置”中填写并测试。" }),
-        onboardingCategoryMessage ? el("div", { className: "onboarding-run-status", textContent: onboardingCategoryMessage }) : null,
+        el("p", { textContent: "分类目录生成使用 OpenAI-compatible API。Jev 用于视频分类，不生成分类目录。" }),
+        el("div", { className: "onboarding-api-state " + (configured ? "ready" : "missing"), textContent: configured ? "API 已设置，可以先测试，或直接生成分类目录。" : "API 尚未设置完整，请先到顶部设置弹窗中填写并测试。" }),
+        onboardingCategoryMessage ? renderFeedbackNotice("onboarding-run-status", onboardingCategoryMessage) : null,
         el("div", { className: "onboarding-actions" }, [
           el("button", { className: "ghost", dataset: { action: "back-onboarding-setup" }, textContent: "← 返回上一步" }),
           el("button", { dataset: { action: "open-onboarding-api-settings" }, textContent: "设置API" }),
@@ -352,7 +459,7 @@
       content = [
         el("div", { className: "onboarding-kicker", textContent: "首次使用 · 2 / 3 · 手动" }),
         el("h2", { textContent: "编辑分类目录" }),
-        el("p", { textContent: "编辑分类目录会在右侧栏展开。你可以增删、改名或调整父级，点击“确定保存”后再继续。" }),
+        el("p", { textContent: "编辑分类目录会在设置弹窗中展开。你可以增删、改名或调整父级，点击“确定保存”后再继续。" }),
         el("div", { className: "onboarding-actions" }, [
           el("button", { className: "ghost", dataset: { action: "back-onboarding-setup" }, textContent: "← 返回上一步" }),
           el("button", { dataset: { action: "reopen-onboarding-categories" }, textContent: "展开编辑分类目录" }),
@@ -409,7 +516,7 @@
       el("strong", { textContent: titleValue + " · " + rows.length + " 项" }),
       el("div", {}, rows.map(({ category, level }) => el("span", {
         className: "onboarding-category-level-" + Math.min(level, 2),
-        textContent: (level ? "└ ".padStart(level * 2 + 2, "　") : "") + category.name
+        textContent: categoryTreeLabel(category, level)
       })))
     ]);
   }
@@ -421,10 +528,10 @@
     let description = "调整完成后，继续了解分类等级。";
     if (stage === "setup-categories") {
       titleValue = "正在编辑分类目录";
-      description = "在右侧编辑分类目录中调整草稿，并点击“确定保存”。";
+      description = "在设置弹窗的编辑分类目录中调整草稿，并点击“确定保存”。";
     } else if (stage === "setup-api") {
       titleValue = "正在设置 API";
-      description = "在右侧设置中保存并测试 API，然后返回首次引导。";
+      description = "在设置弹窗中保存并测试 API，然后返回首次引导。";
     } else if (stage === "classify") {
       titleValue = "完成一次首次分类";
       description = "保存手动确认、导入 JSON 或完成 AI 视频分类后，引导会自动结束。";
@@ -445,96 +552,154 @@
 
   function renderSidebar() {
     return el("aside", { className: "sidebar" }, [
-      el("div", { className: "side-head" }, [
-        el("h1", { textContent: "稍后再看整理助手" }),
-        el("div", { className: "sub", textContent: "自动归类，快速找到想看的视频" })
-      ]),
       renderCategoryTree()
     ]);
   }
 
-  function renderStats() {
-    const summary = state.classifySummary || {};
-    const counts = summary.total == null
-      ? core.classificationStageCounts(state.videos, state.classifications)
-      : {
-        total: summary.total,
-        pending: summary.pendingFineClassification,
-        ai: summary.aiClassified,
-        manual: summary.manualConfirmed
-      };
-    return el("div", { className: "stats" }, [
-      statNode(counts.total || 0, "全部视频"),
-      statNode(counts.pending || 0, "待精细分类"),
-      statNode(counts.ai || 0, "AI 已分类"),
-      statNode(counts.manual || 0, "手动确认")
-    ]);
-  }
-
-  function renderEditorHeader() {
+  function renderStatusNotice() {
     const textValue = statusText();
-    const kind = statusKind(textValue);
-    return el("div", { className: "editor-sticky-header" }, [
-      renderStats(),
-      el("section", {
-        className: "activity-status status-" + kind,
-        dataset: { role: "status-surface" },
-        role: "status",
-        "aria-live": "polite"
-      }, [
-        el("span", { className: "activity-status-icon", dataset: { role: "status-icon" } }, [statusIcon(kind)]),
-        el("div", { className: "activity-status-copy" }, [
-          el("strong", { textContent: "操作反馈" }),
-          el("span", { dataset: { role: "status" }, textContent: textValue })
-        ])
+    const kind = statusNotice.text ? statusNotice.kind : statusKind(textValue);
+    return el("section", {
+      className: "activity-status feedback-notice status-" + kind,
+      dataset: { role: "status-surface" },
+      hidden: Date.now() >= noticeExpiresAt,
+      popover: "manual",
+      role: "status",
+      "aria-live": "polite",
+      "aria-atomic": "true"
+    }, [
+      renderFeedbackAura("operation-feedback"),
+      el("span", { className: "activity-status-icon", dataset: { role: "status-icon" } }, [statusIcon(kind)]),
+      el("div", { className: "activity-status-copy" }, [
+        el("strong", { textContent: "操作反馈" }),
+        el("span", { dataset: { role: "status" }, textContent: textValue })
       ])
-    ]);
-  }
-
-  function statNode(value, label) {
-    return el("div", { className: "stat" }, [
-      el("strong", { textContent: String(value) }),
-      el("span", { textContent: label })
     ]);
   }
 
   function renderCategoryTree() {
     const counts = categoryCounts();
+    const allActive = !activeFilter.categoryIds.length && !activeFilter.includeUnclassified;
     const fragment = document.createDocumentFragment();
-    fragment.appendChild(el("button", {
-      className: "cat-row" + (!activeFilter.categoryIds.length && !activeFilter.includeUnclassified ? " active" : ""),
-      dataset: { action: "filter-all" }
+    const header = el("div", { className: "sidebar-sticky" }, [
+      el("div", { className: "side-head" }, [
+        el("h1", { textContent: "稍后再看整理助手" }),
+        el("div", { className: "sub", textContent: "自动归类，快速找到想看的视频" })
+      ])
+    ]);
+    const pinned = el("div", { className: "sidebar-filters", "aria-label": "视频范围" });
+    pinned.appendChild(el("button", {
+      className: "cat-row category-root" + (allActive ? " active" : ""),
+      "aria-current": allActive ? "true" : "false",
+      style: "--aura-hue:205",
+      dataset: { action: "filter-all", auraSize: "large" }
     }, [
+      allActive ? renderCategoryAura() : null,
       el("span", { className: "cat-name", textContent: "全部视频" }),
       el("span", { className: "cat-count", textContent: String(presentVideos().length) })
     ]));
-    fragment.appendChild(el("button", {
-      className: "cat-row" + (activeFilter.includeUnclassified ? " active" : ""),
-      dataset: { action: "filter-unclassified" }
+    pinned.appendChild(el("button", {
+      className: "cat-row category-root" + (activeFilter.includeUnclassified ? " active" : ""),
+      "aria-current": activeFilter.includeUnclassified ? "true" : "false",
+      style: "--aura-hue:35",
+      title: "需要进一步确认的视频：只有初步分类、结果过旧或不确定；也可能已有内容类别。",
+      dataset: { action: "filter-unclassified", auraSize: "large" }
     }, [
+      activeFilter.includeUnclassified ? renderCategoryAura("large", "pending") : null,
       el("span", { className: "cat-name", textContent: "待精细分类" }),
       el("span", { className: "cat-count", textContent: String(counts.unclassified) })
     ]));
-    appendCategoryLevel(fragment, "", 0, counts);
-    return el("nav", { className: "cat-nav" }, [fragment]);
+    const cycle = el("div", { className: "category-cycle", dataset: { categoryCycle: "original" } });
+    appendCategoryLevel(cycle, "", 0, counts);
+    fragment.appendChild(cycle);
+    return el("div", { className: "category-browser" }, [header, pinned, el("nav", { className: "cat-nav", "aria-label": "内容分类" }, [fragment])]);
+  }
+
+  function setupCategoryLoop(nav) {
+    if (categoryLoopObserver) categoryLoopObserver.disconnect();
+    const cycle = nav.querySelector('[data-category-cycle="original"]');
+    if (!cycle) return;
+    let layout = "";
+    const rebuild = () => {
+      const height = cycle.getBoundingClientRect().height;
+      const nextLayout = [nav.clientWidth, nav.clientHeight, height].join(":");
+      if (layout === nextLayout) return;
+      layout = nextLayout;
+      const previousHeight = Number(nav.dataset.cycleHeight) || 0;
+      const offset = previousHeight ? categoryLoopOffset(nav.scrollTop, previousHeight) : savedCategoryScrollTop;
+      const focused = document.activeElement;
+      const focusId = focused && nav.contains(focused) ? focused.dataset.categoryId : "";
+      const focusTop = focusId ? focused.getBoundingClientRect().top : 0;
+      nav.querySelectorAll('[data-category-cycle="copy"]').forEach((node) => node.remove());
+      nav.dataset.cycleHeight = String(height);
+      if (!height) return;
+      // Enough repeated content to fill even a tall viewport with a short directory.
+      const copies = Math.ceil(nav.clientHeight / height) + 2;
+      for (let i = 0; i < copies; i++) {
+        const copy = cycle.cloneNode(true);
+        copy.dataset.categoryCycle = "copy";
+        copy.querySelectorAll(".category-glass").forEach(node => node.remove());
+        copy.querySelectorAll(".aura-preview").forEach(row => {
+          row.classList.remove("aura-preview");
+          if (!row.classList.contains("active")) row.querySelector(".category-aura")?.remove();
+        });
+        if (i === 0) nav.insertBefore(copy, cycle);
+        else nav.appendChild(copy);
+      }
+      nav.scrollTop = height + categoryLoopOffset(offset, height);
+      if (focusId) {
+        const equivalent = Array.from(nav.querySelectorAll('[data-action="filter-category"]'))
+          .filter(row => row.dataset.categoryId === focusId)
+          .sort((a, b) => Math.abs(a.getBoundingClientRect().top - focusTop) - Math.abs(b.getBoundingClientRect().top - focusTop))[0];
+        if (equivalent) equivalent.focus({ preventScroll: true });
+      }
+      globalThis.BiliWLAura.refresh();
+      ensureCategoryGlass();
+    };
+    rebuild();
+    nav.addEventListener("scroll", () => { wrapCategoryLoop(nav); ensureCategoryGlass(); }, { passive: true });
+    categoryLoopObserver = new ResizeObserver(rebuild);
+    categoryLoopObserver.observe(nav);
+    categoryLoopObserver.observe(cycle);
+  }
+
+  function categoryLoopOffset(scrollTop, height) {
+    return ((scrollTop % height) + height) % height;
+  }
+
+  function wrapCategoryLoop(nav) {
+    const height = Number(nav.dataset.cycleHeight);
+    if (!height) return;
+    if (nav.scrollTop >= height && nav.scrollTop < height * 2) return;
+    const next = height + categoryLoopOffset(nav.scrollTop, height);
+    const focused = document.activeElement;
+    const cycles = Array.from(nav.querySelectorAll(".category-cycle"));
+    const focusedCycle = focused && focused.closest(".category-cycle");
+    if (focusedCycle && nav.contains(focused)) {
+      const index = cycles.indexOf(focusedCycle) + Math.round((next - nav.scrollTop) / height);
+      const equivalent = cycles[index] && Array.from(cycles[index].querySelectorAll('[data-action="filter-category"]'))
+        .find((button) => button.dataset.categoryId === focused.dataset.categoryId);
+      if (equivalent) equivalent.focus({ preventScroll: true });
+    }
+    nav.scrollTop = next;
   }
 
   function appendCategoryLevel(fragment, parentId, level, counts) {
     core.childrenOf(state.categories, parentId).forEach((category) => {
-      const expanded = expandCategoryIds([category.id]);
-      const active = activeFilter.sourceCategoryId === category.id || expanded.length && expanded.every((id) => activeFilter.categoryIds.includes(id));
+      const active = activeFilter.sourceCategoryId === category.id;
+      const large = level === 0 || core.childrenOf(state.categories, category.id).length > 0;
       const group = el("div", {
         className: "category-tree-group",
-        draggable: true,
-        title: "拖动可调整同级顺序；此分类及全部子分类会一起移动",
         dataset: { categoryGroup: category.id }
       }, [
         el("button", {
-          className: "cat-row category-draggable indent-" + Math.min(level, 3) + (active ? " active" : ""),
-          style: categoryStyle(category, "row"),
-          dataset: { action: "filter-category", categoryId: category.id }
+          className: "cat-row indent-" + Math.min(level, 3) + (level === 0 ? " category-root" : "") + (active ? " active" : ""),
+          "aria-current": active ? "true" : "false",
+          style: categoryAuraStyle(category.id),
+          title: category.id === "other.todo" ? "暂时找不到合适类别的视频。是否还需处理，请看“待精细分类”。" : category.name,
+          dataset: { action: "filter-category", categoryId: category.id, auraSize: large ? "large" : "small" }
         }, [
-          el("span", { className: "category-drag-handle", title: "拖动分类及其子分类", "aria-hidden": "true", textContent: "⋮⋮" }),
+          active ? renderCategoryAura(large ? "large" : "small", category.id) : null,
           el("span", { className: "cat-name", textContent: category.name }),
           el("span", { className: "cat-count", textContent: String(counts.byCategory.get(category.id) || 0) })
         ])
@@ -544,34 +709,117 @@
     });
   }
 
+  function categoryAuraStyle(id) {
+    // Avalanche the ID hash so siblings and sequential IDs do not cluster in one hue.
+    let hash = 2166136261;
+    for (const char of id) hash = Math.imul(hash ^ char.codePointAt(0), 16777619) >>> 0;
+    hash = Math.imul(hash ^ (hash >>> 16), 0x85ebca6b) >>> 0;
+    hash = Math.imul(hash ^ (hash >>> 13), 0xc2b2ae35) >>> 0;
+    hash = (hash ^ (hash >>> 16)) >>> 0;
+    const palettes = [
+      [145, 175, 210], // mint / lagoon / sky
+      [185, 215, 250], // ice / blue / periwinkle
+      [220, 255, 292], // cornflower / lavender / orchid
+      [260, 292, 326], // lilac / mauve / rose
+      [310, 340, 375], // berry / blush / coral
+      [345, 378, 408], // rose / peach / honey
+      [15, 40, 68], // apricot / amber / butter
+      [48, 80, 114], // gold / lime / sage
+      [78, 116, 156], // citrus / fern / jade
+      [118, 151, 186], // leaf / seafoam / aqua
+      [165, 205, 260], // turquoise / azure / iris
+      [205, 252, 312], // blue / violet / pink
+      [270, 312, 350], // wisteria / peony / watermelon
+      [320, 360, 402], // pink / coral / champagne
+      [28, -8, -52], // peach / rose / lavender
+      [64, 26, -12], // vanilla / apricot / pink
+      [110, 70, 28], // pistachio / butter / peach
+      [182, 145, 95], // aqua / mint / chartreuse
+      [242, 202, 160], // periwinkle / sky / seafoam
+      [290, 247, 204], // orchid / iris / ice
+      [340, 288, 235], // rose / lilac / blue
+      [35, -20, -65], // sunrise / blush / iris
+      [155, 198, 238], // jade / ocean / cornflower
+      [230, 275, 325] // twilight / violet / pink
+    ];
+    const [a, b, c] = palettes[hash % palettes.length];
+    const variation = ((hash >>> 8) % 141 - 70) / 10;
+    return "--aura-hue:" + ((b + variation + 360) % 360).toFixed(1) +
+      ";--aura-shift-a:" + (a - b) + ";--aura-shift-b:0;--aura-shift-c:" + (c - b);
+  }
+
+  function renderCategoryAura(size = "large", seed = "all") {
+    let random = 0;
+    for (const char of seed) random = (Math.imul(random, 31) + char.charCodeAt(0)) >>> 0;
+    const particles = Array.from({ length: size === "large" ? 28 : 16 }, (_, index) => {
+      random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
+      return el("span", {
+        className: "category-particle",
+        dataset: { depth: random / 4294967296 < .4 ? "front" : "back" },
+        style: "--particle-x:" + (12 + (index * 29 % 50)) + "%;--particle-y:" + (15 + index * 37 % 70) +
+          "%;--particle-size:" + (index % 6 === 0 ? 1.6 : index % 3 === 0 ? 1.2 : .9) + "px;--particle-delay:" + (-index * .71) +
+          "s;--particle-duration:" + (4.8 + index % 5 * .4) + "s;--particle-travel:" + (48 + index * 17 % 60) +
+          "px;--particle-tail:" + (index % 5 === 0 ? .18 : 0)
+      });
+    });
+    return el("span", { className: "category-aura", "aria-hidden": "true" }, [
+      el("span", { className: "category-aura-backdrop" }, [
+        el("canvas", { className: "category-aura-flow" }),
+        el("span", { className: "category-aura-grain" })
+      ]),
+      ...particles
+    ]);
+  }
+
   function renderCategoryAdmin() {
     const draft = ensureCategoryDraft();
     const categoryRows = flattenCategoriesInTree(draft);
-    const parentOptions = [el("option", { value: "", textContent: "一级分类" })]
+    const parentOptions = [el("option", { value: "", textContent: "无上级（一级分类）", selected: !newCategoryDraft.parent })]
       .concat(categoryRows.map(({ category, level }) => el("option", {
         value: category.id,
+        selected: category.id === newCategoryDraft.parent,
         textContent: categoryTreeLabel(category, level)
       })));
-    return el("section", { className: "fold", dataset: { fold: "category-admin" } }, [
-      el("button", { className: "fold-head", dataset: { action: "toggle-category-admin" } }, [
-        el("h2", { textContent: "编辑分类目录" }),
-        el("span", { dataset: { role: "fold-icon" }, textContent: categoryAdminOpen ? "⌃" : "⌄" })
-      ]),
-      el("div", { className: "fold-body" + (categoryAdminOpen ? "" : " hidden") }, [
-        renderCategoryGenerationTools(),
-        el("div", { className: "category-form" }, [
-          el("select", { dataset: { role: "new-category-parent" } }, parentOptions),
-          el("input", { type: "text", placeholder: "新分类名", dataset: { role: "new-category-name" } }),
+    return el("section", { className: "settings-page", hidden: settingsPage !== "directory", dataset: { settingsPage: "directory", fold: "category-admin" } }, [
+      settingsSectionHeader("编辑分类目录", "这里决定有哪些类别及其层级，不是在给视频分类。修改草稿后需确定保存。", "directory", directoryMode,
+        [["edit", "手动编辑"], ["generate", "让 AI 生成目录"]]),
+      el("div", { className: "settings-page-body" }, [
+      el("div", { className: "directory-edit", hidden: directoryMode !== "edit", dataset: { settingsGroup: "directory", settingsValue: "edit" } }, [
+        el("div", { className: "category-admin-summary" }, [
+          el("h3", { textContent: "目录草稿" }),
+          el("span", { className: "sub", textContent: categoryRows.filter((row) => row.level === 0).length + " 个一级分类 · " + categoryRows.length + " 个类别" }),
+          el("button", { className: "ghost", dataset: { action: "toggle-category-add" }, "aria-expanded": String(categoryAddOpen), textContent: categoryAddOpen ? "收起添加" : "添加类别" })
+        ]),
+        el("div", { className: "category-form", hidden: !categoryAddOpen, dataset: { role: "category-add-form" } }, [
+          el("label", { className: "field" }, [
+            el("span", { textContent: "分类名称" }),
+            el("input", { type: "text", value: newCategoryDraft.name, placeholder: "输入新分类名", dataset: { role: "new-category-name" } })
+          ]),
+          el("label", { className: "field" }, [
+            el("span", { textContent: "上级分类" }),
+            el("select", { value: newCategoryDraft.parent, dataset: { role: "new-category-parent" } }, parentOptions)
+          ]),
           el("button", { dataset: { action: "add-category" }, textContent: "添加分类" })
         ]),
-        el("div", { className: "sub", textContent: "这里的新增、改名、移动和删除都是草稿，点击“确定保存”后才会生效。" }),
-        el("div", { className: "category-admin-list" }, categoryRows.map(({ category, level }) => renderCategoryAdminRow(category, level, draft))),
-        el("div", { className: "refresh-actions" }, [
+        el("div", { className: "category-table-head", "aria-hidden": "true" }, [
+          el("span", { textContent: "层级" }), el("span", { textContent: "分类名称" }),
+          el("span", { textContent: "上级分类" }), el("span", { textContent: "" })
+        ]),
+        el("div", { className: "category-admin-list settings-scroll", "aria-label": "分类目录草稿", dataset: { scrollKey: "directory-edit" } }, [
+          ...categoryRows.map(({ category, level }) => renderCategoryAdminRow(category, level, draft))
+        ]),
+      ]),
+      el("div", { className: "settings-scroll directory-generate", hidden: directoryMode !== "generate", dataset: { settingsGroup: "directory", settingsValue: "generate", scrollKey: "directory-generate" } }, [renderCategoryGenerationTools()])
+      ]),
+      el("div", { className: "category-save-actions", hidden: directoryMode !== "edit", dataset: { settingsGroup: "directory", settingsValue: "edit" } }, [
+          el("span", {
+            className: "category-draft-status" + (categoryDraftDirty ? " is-dirty" : ""),
+            dataset: { role: "category-draft-status" }, textContent: categoryDraftDirty ? "有未保存修改" : "与已保存目录一致"
+          }),
           el("button", { className: "primary", dataset: { action: "save-category-draft" }, textContent: "确定保存" }),
-          el("button", { className: "ghost", dataset: { action: "discard-category-draft" }, textContent: "放弃未保存修改" }),
-          categoryDraftDirty ? el("span", { className: "sub", textContent: "有未保存修改" }) : null
-        ].filter(Boolean))
-      ].filter(Boolean))
+          el("button", { className: "ghost", dataset: { action: "discard-category-draft" }, textContent: "放弃未保存修改" })
+        ])
+
     ]);
   }
 
@@ -593,7 +841,7 @@
         }),
         el("button", { className: "ghost", dataset: { action: "open-api-settings" }, textContent: "设置API" })
       ]),
-      categoryGeneration.message ? el("div", { className: "category-generation-status", textContent: categoryGeneration.message }) : null,
+      categoryGeneration.message ? renderFeedbackNotice("category-generation-status", categoryGeneration.message) : null,
       categoryGeneration.mode === "prompt" ? renderCategoryPromptEditor() : null
     ].filter(Boolean));
   }
@@ -618,15 +866,29 @@
 
   function renderMain(visible) {
     return el("main", { className: "main" }, [
-      el("div", { className: "topbar" }, [
-        el("input", { className: "search-input", type: "search", value: searchText, placeholder: "搜索标题、UP主、分区、标签、BV号", dataset: { role: "search" } }),
-        el("div", { className: "toolbar" }, [
-          el("select", { title: "筛选视频", dataset: { role: "video-filter" } }, videoFilterOptions()),
-          el("select", { title: "排序", dataset: { role: "sort-combo" } }, sortOptions()),
-          el("button", { className: "primary", title: "先同步列表，再排队更新缺失详情", dataset: { action: "sync-refresh" }, textContent: "同步并更新" }),
-          toolbarIconButton("open-bili-home", "B站主页", "bilibili"),
-          toolbarIconButton("open-watchlater", "稍后再看", "watchlater"),
-          toolbarIconButton("open-bili-dynamic", "B站动态", "dynamic")
+      el("div", { className: "topbar liquid-glass liquid-glass--simple glass-panel" }, [
+        el("div", { className: "toolbar liquid-glass__content" }, [
+          el("div", { className: "toolbar-find", role: "group", "aria-label": "查找视频" }, [
+            el("label", { className: "glass-search liquid-glass liquid-glass--simple glass-control" }, [
+              iconNode("search"),
+              el("input", { className: "search-input", type: "search", value: searchText, "aria-label": "搜索视频", title: "搜索标题、UP主、分区、标签、BV号", placeholder: "搜索视频、UP主…", "aria-describedby": "search-scope-hint", dataset: { role: "search" } })
+            ]),
+            el("select", { className: "liquid-glass liquid-glass--simple glass-control glass-select", title: "筛选视频", "aria-label": "筛选视频", dataset: { role: "video-filter" } }, videoFilterOptions()),
+            el("select", { className: "liquid-glass liquid-glass--simple glass-control glass-select", title: "排序", "aria-label": "排序", dataset: { role: "sort-combo" } }, sortOptions()),
+            el("button", { className: "shuffle-button liquid-glass liquid-glass--simple glass-control", title: "乱序：随机排列当前筛选的视频，再次点击重新打乱", "aria-label": "乱序", disabled: visible.length < 2, dataset: { action: "shuffle-videos" } }, [iconNode("shuffle")])
+          ]),
+          el("span", { className: "toolbar-divider", "aria-hidden": "true" }),
+            el("div", { className: "toolbar-maintenance", role: "group", "aria-label": "更新与管理" }, [
+              el("button", { className: "sync-button liquid-glass liquid-glass--simple glass-control glass-tinted", title: "同步并更新：先同步列表，再排队更新缺失详情", "aria-label": "同步并更新", dataset: { action: "sync-refresh" } }, [iconNode("sync"), el("span", { textContent: "同步并更新" })]),
+              el("button", { className: "batch-button liquid-glass liquid-glass--simple glass-control", title: batchMode ? "退出批量" : "批量管理", "aria-label": batchMode ? "退出批量" : "批量管理", "aria-pressed": String(batchMode), dataset: { action: "toggle-batch" } }, [iconNode("batch"), el("span", { textContent: batchMode ? "退出批量" : "批量管理" })]),
+              el("button", { className: "settings-button liquid-glass liquid-glass--simple glass-control", title: "设置", "aria-label": "设置", dataset: { action: "open-management" }, "aria-haspopup": "dialog" }, [iconNode("settings")])
+            ]),
+            el("span", { className: "toolbar-divider", "aria-hidden": "true" }),
+            el("nav", { className: "toolbar-navigation", "aria-label": "B站导航" }, [
+              toolbarIconButton("open-bili-home", "B站主页", "bilibili"),
+              toolbarIconButton("open-watchlater", "稍后再看", "watchlater"),
+              toolbarIconButton("open-bili-dynamic", "B站动态", "dynamic")
+            ])
         ]),
         batchMode ? renderBatchPanel() : null
       ]),
@@ -638,8 +900,9 @@
     return el("div", { className: "content", dataset: { role: "content" } }, [
       renderBatchSelectionBox(),
       el("div", { className: "list-head" }, [
-        el("span", { textContent: "当前显示 " + visible.length + " / " + presentVideos().length + " 个" }),
-        el("span", { textContent: activeFilterLabel() })
+        el("h2", { className: "content-title", textContent: activeFilterLabel() }),
+        el("span", { id: "search-scope-hint", className: "search-scope-hint", hidden: !searchText.trim(), role: "status", textContent: "关键词筛选中", title: "当前分类中仅显示匹配关键词的视频；清空搜索可查看全部结果。" }),
+        el("span", { textContent: visible.length + " 个视频" + (searchText.trim() ? " · 仅显示搜索匹配" : "") })
       ]),
       visible.length
         ? el("div", { className: "grid" }, visible.map(renderVideoCard))
@@ -658,9 +921,14 @@
         (selectedBvids.has(video.bvid) ? " batch-selected" : "") +
         (syncAnimations.added.has(video.bvid) ? " sync-added" : "") +
         (syncAnimations.changed.has(video.bvid) ? " sync-updated" : ""),
-      dataset: { action: "select-video", bvid: video.bvid }
+      dataset: { action: "select-video", bvid: video.bvid },
+      tabindex: "0",
+      "aria-label": "手动调整视频分类：" + (video.title || video.bvid),
+      // Detail refreshes rebuild cards; resume the same animation instead of replaying it.
+      style: syncAnimations.added.has(video.bvid) || syncAnimations.changed.has(video.bvid)
+        ? "animation-delay:-" + Math.max(0, Date.now() - syncAnimationStartedAt) + "ms;" : ""
     }, [
-      batchMode ? el("div", { className: "select-mark", textContent: selectedBvids.has(video.bvid) ? "✓" : "" }) : null,
+      batchMode ? el("div", { className: "select-mark" }, selectedBvids.has(video.bvid) ? [iconNode("check")] : []) : null,
       batchMode ? renderCover(video) : el("a", {
         className: "cover-link",
         href: core.standardVideoUrl(video),
@@ -675,13 +943,14 @@
         el("div", { className: "meta", textContent: [formatDate(video.pubdate), formatWatchlaterDate(video.watchlaterAddedAt)].filter(Boolean).join(" · ") }),
         el("div", { className: "badges" }, [
           ...(sourceType ? [el("span", { className: "badge source source-" + sourceType, textContent: sourceLabel(sourceType) })] : []),
-          ...(["unclassified", "stale", "low_confidence"].includes(status) ? [el("span", { className: "badge warn", textContent: statusLabel(status) })] : []),
-          ...(categoryBadgeNodes(classification).length ? categoryBadgeNodes(classification) : [el("span", { className: "badge warn", textContent: "分类异常" })]).slice(0, 4)
+          ...(["unclassified", "stale", "low_confidence"].includes(status) ? [el("span", { className: "badge warn status-" + status, textContent: statusLabel(status) })] : []),
+          ...(categoryBadgeNodes(classification).length ? categoryBadgeNodes(classification) : [el("span", { className: "badge warn status-unclassified", textContent: "分类异常" })]).slice(0, 4)
         ]),
         el("div", { className: "card-actions" }, [
           el("a", { href: core.watchlaterPlaybackUrl(video), target: "_blank", rel: "noopener noreferrer", textContent: "稍后合集中打开" }),
           el("button", {
             className: "danger remove-icon",
+            type: "button",
             title: "移出稍后再看",
             "aria-label": "移出稍后再看",
             dataset: { action: "remove-watchlater", bvid: video.bvid }
@@ -693,9 +962,6 @@
 
   function renderBatchPanel() {
     if (!batchMode) return el("div", { className: "batch-panel hidden" });
-    const categoryRows = flattenCategoriesInTree();
-    const selectedCategory = categoryRows.find(({ category }) => category.id === batchCategoryId) || categoryRows[0];
-    if (selectedCategory) batchCategoryId = selectedCategory.category.id;
     return el("section", { className: "batch-panel" }, [
       el("div", { className: "batch-panel-summary" }, [
         el("div", {}, [
@@ -712,24 +978,12 @@
         ])
       ]),
       el("div", { className: "batch-form" }, [
-        el("div", { className: "batch-category-picker" }, [
-          selectedCategory ? el("span", {
-            className: "swatch batch-category-swatch",
-            style: categoryStyle(selectedCategory.category, "swatch"),
-            dataset: { role: "batch-category-swatch" }
-          }) : null,
-          el("select", { dataset: { role: "batch-category" }, title: "选择要添加的分类" }, categoryRows.map(({ category, level }) => {
-            const prefix = level ? "　".repeat(level) + "└ " : "";
-            return el("option", {
-              value: category.id,
-              selected: category.id === batchCategoryId,
-              style: categoryStyle(category, "option"),
-              textContent: "● " + prefix + category.name
-            });
-          }))
-        ]),
-        el("button", { className: "primary", dataset: { action: "batch-add-category" }, textContent: "添加分类到选中视频" }),
-        el("button", { className: "danger", dataset: { action: "batch-clear-categories" }, textContent: "清除选中视频中所有现有分类" })
+        el("p", { className: "sub", textContent: "可同时勾选多个分类，添加后保留视频原有分类。" }),
+        renderCategoryChoices(batchCategoryIds, "batch-category"),
+        el("div", { className: "batch-actions" }, [
+          el("button", { className: "primary", dataset: { action: "batch-add-category" }, textContent: "添加所选分类到视频" }),
+          el("button", { className: "danger", dataset: { action: "batch-clear-categories" }, textContent: "清除选中视频中所有现有分类" })
+        ])
       ])
     ]);
   }
@@ -746,56 +1000,173 @@
     });
   }
 
-  function renderEditor(visible) {
-    if (batchMode) {
-      return renderBatchEditor();
+  function captureModalDraft() {
+    const dialog = document.querySelector(".management-dialog");
+    if (!dialog) return;
+    if (manualEditorOpen && dialog.querySelector('[data-role="manual-category"]')) {
+      manualCategoryDraft = {
+        bvid: selectedBvid,
+        ids: Array.from(dialog.querySelectorAll('[data-role="manual-category"]:checked'), node => node.value)
+      };
     }
-    const video = state.videos.find((item) => item.bvid === selectedBvid) || null;
-    const classification = video ? classificationMap().get(video.bvid) : null;
-    const selectedIds = new Set(classification && classification.categoryIds || []);
-    return el("aside", { className: "editor" }, [
-      renderEditorHeader(),
-      el("div", { className: "editor-body" }, [
-        renderManualEditor(video, selectedIds),
-        renderLlmAutomation(),
-        renderCategoryAdmin(),
-        renderApiSettings()
-      ])
+    if (managementOpen) harvestCategoryDraft();
+  }
+
+  function settingsSectionHeader(title, description, group, current, options) {
+    return el("div", { className: "settings-section-header" }, [
+      el("h3", { textContent: title }),
+      el("p", { textContent: description }),
+      el("nav", { className: "settings-tabs", "aria-label": title + "方式" }, options.map(([value, label]) => el("button", {
+        type: "button", "aria-pressed": String(current === value),
+        dataset: { action: "select-settings-tab", group, value }, textContent: label
+      })))
     ]);
   }
 
-  function renderBatchEditor() {
-    return el("aside", { className: "editor batch-editor" }, [
-      renderEditorHeader(),
-      el("div", { className: "editor-body" }, [
-        el("section", { className: "batch-editor-card" }, [
-          el("div", { className: "batch-editor-heading" }, [
-            el("h2", { textContent: "正在批量管理" }),
-            el("strong", {
-              dataset: { role: "batch-editor-count" },
-              textContent: batchEditorCountText()
-            })
-          ]),
-          el("div", { className: "batch-editor-note", textContent: "单个视频的手动调整已暂停。请在中间列表选择视频，并使用顶部固定操作区调整分类。" }),
-          el("div", { className: "batch-editor-actions" }, [
-            el("button", { className: "primary", dataset: { action: "toggle-batch" }, textContent: "退出批量管理" }),
-            el("button", { className: "ghost", dataset: { action: "batch-clear-selection" }, textContent: "清空选择" })
-          ])
-        ]),
-        renderLlmAutomation(),
-        renderCategoryAdmin(),
-        renderApiSettings()
-      ])
+  function renderSettingsWorkspace() {
+    return el("div", { className: "settings-workspace" }, [
+      el("nav", { className: "settings-nav", "aria-label": "设置导航" }, [
+        ["classify", "AI 批量视频分类", "给具体视频分配类别"],
+        ["directory", "编辑分类目录", "修改可选类别与层级"],
+        ["preferences", "API 与自动化", "连接服务、定时分类和日志"]
+      ].map(([page, title, description]) => el("button", {
+        type: "button", "aria-current": settingsPage === page ? "page" : "false",
+        dataset: { action: "select-settings-page", page }
+      }, [el("strong", { textContent: title }), el("span", { textContent: description })]))),
+      el("div", { className: "settings-pages" }, [renderLlmAutomation(), renderCategoryAdmin(), renderApiSettings()])
     ]);
+  }
+
+  function rememberSettingsScroll() {
+    document.querySelectorAll(".settings-scroll").forEach(node => {
+      if (node.offsetParent) settingsScrollTops.set(node.dataset.scrollKey, node.scrollTop);
+    });
+  }
+
+  function restoreSettingsScroll() {
+    document.querySelectorAll(".settings-scroll").forEach(node => {
+      if (node.offsetParent) node.scrollTop = settingsScrollTops.get(node.dataset.scrollKey) || 0;
+    });
+  }
+
+  function updateSettingsNavigation() {
+    document.querySelectorAll("[data-settings-page]").forEach(node => {
+      node.hidden = node.dataset.settingsPage !== settingsPage;
+    });
+    document.querySelectorAll('[data-action="select-settings-page"]').forEach(node => {
+      node.setAttribute("aria-current", settingsPage === node.dataset.page ? "page" : "false");
+    });
+    const selections = { ai: aiMethod, directory: directoryMode, preferences: preferencesPage };
+    document.querySelectorAll("[data-settings-group]").forEach(node => {
+      node.hidden = selections[node.dataset.settingsGroup] !== node.dataset.settingsValue;
+    });
+    document.querySelectorAll('[data-action="select-settings-tab"]').forEach(node => {
+      node.setAttribute("aria-pressed", String(selections[node.dataset.group] === node.dataset.value));
+    });
+    restoreSettingsScroll();
+    globalThis.BiliWLAura.refresh();
+  }
+
+  function selectSettingsPage(page, subpage) {
+    rememberSettingsScroll();
+    settingsPage = page;
+    if (page === "classify" && subpage) aiMethod = subpage;
+    if (page === "directory" && subpage) directoryMode = subpage;
+    if (page === "preferences" && subpage) preferencesPage = subpage;
+    updateSettingsNavigation();
+  }
+
+  function renderEditor() {
+    const host = el("div", { className: "modal-host" });
+    const video = presentVideos().find(item => item.bvid === selectedBvid);
+    if (!managementOpen && !(manualEditorOpen && video)) return host;
+    const manual = !managementOpen && manualEditorOpen && video;
+    const classification = video ? classificationMap().get(video.bvid) : null;
+    const selectedIds = new Set(manualCategoryDraft?.bvid === selectedBvid
+      ? manualCategoryDraft.ids : classification?.categoryIds || []);
+    host.appendChild(el("dialog", {
+      className: "management-dialog editor" + (manual ? " manual-dialog" : " settings-dialog"),
+      "aria-labelledby": "management-title"
+    }, [
+      el("div", { className: "modal-header" }, [
+        el("h2", { id: "management-title", textContent: manual ? "手动调整视频分类" : "设置" }),
+        el("button", { className: "modal-close", type: "button", dataset: { action: "close-modal" }, "aria-label": "关闭面板" }, [iconNode("close")])
+      ]),
+      el("div", { className: "editor-body" }, manual
+        ? [renderManualEditor(video, selectedIds)]
+        : [renderSettingsWorkspace()]),
+      ...(manual ? [el("div", { className: "editor-actions" }, [
+        el("button", { className: "primary", dataset: { action: "save-manual", bvid: video.bvid }, textContent: "保存为手动确认" }),
+        el("button", { className: "ghost", dataset: { action: "filter-unclassified" }, textContent: "查看待精细分类" }),
+        el("button", { className: "ghost", dataset: { action: "toggle-batch" }, textContent: batchMode ? "退出批量" : "批量管理" })
+      ])] : [])
+    ]));
+    return host;
+  }
+
+  function captureModalFocus() {
+    const field = document.activeElement;
+    if (!field?.closest(".management-dialog") || !field.dataset.role) return null;
+    return { role: field.dataset.role, categoryId: field.dataset.categoryId,
+      value: field.type === "checkbox" ? field.value : null,
+      start: field.selectionStart, end: field.selectionEnd };
+  }
+
+  function restoreModalFocus(focus) {
+    if (!focus) return;
+    const field = Array.from(document.querySelectorAll(".management-dialog [data-role]"))
+      .find(node => node.dataset.role === focus.role && node.dataset.categoryId === focus.categoryId
+        && (focus.value == null || node.value === focus.value));
+    field?.focus({ preventScroll: true });
+    if (field?.setSelectionRange && focus.start != null) field.setSelectionRange(focus.start, focus.end);
+  }
+
+  function showModal() {
+    const dialog = document.querySelector(".management-dialog");
+    if (dialog && !dialog.open) dialog.showModal();
+    restoreSettingsScroll();
+  }
+
+  function closeModal() {
+    captureModalDraft();
+    const wasManagement = managementOpen;
+    managementOpen = false;
+    manualEditorOpen = false;
+    manualCategoryDraft = null;
+    document.querySelector(".management-dialog")?.close();
+    renderEditorOnly();
+    const target = wasManagement ? document.querySelector('[data-action="open-management"]') : videoCardByBvid(selectedBvid);
+    target?.focus({ preventScroll: true });
+  }
+
+  function onModalKeyDown(event) {
+    if (event.isComposing || event.target.closest(".management-dialog")) return;
+    if ((event.key === "Enter" || event.key === " ") && event.target.matches(".video-card")) {
+      event.preventDefault();
+      event.target.click();
+    }
+  }
+
+  function renderCategoryChoices(selectedIds, role) {
+    const categoriesById = core.categoryById(state.categories);
+    return el("div", { className: "check-list manual-category-list", "aria-label": "选择视频分类（可多选）" }, flattenCategoriesInTree()
+      .map(({ category, level }) => el("label", {
+        className: "manual-cat-row" + (level === 0 ? " manual-cat-root" : ""),
+        title: core.categoryPath(category, categoriesById) || category.name
+      }, [
+        el("input", { type: "checkbox", value: category.id, checked: selectedIds.has(category.id), dataset: { role } }),
+        el("span", { className: "manual-cat-copy" }, [
+          el("span", { className: "manual-cat-heading" }, [
+            el("span", { className: "level-badge level-" + (level + 1), textContent: categoryLevelLabel(level) }),
+            el("span", { className: "manual-cat-name", textContent: category.name })
+          ])
+        ])
+      ])));
   }
 
   function renderManualEditor(video, selectedIds) {
     return el("section", { className: "fold", dataset: { fold: "manual-editor" } }, [
-      el("button", { className: "fold-head", dataset: { action: "toggle-manual-editor" } }, [
-        el("h2", { textContent: "手动调整视频分类" }),
-        el("span", { dataset: { role: "fold-icon" }, textContent: manualEditorOpen ? "⌃" : "⌄" })
-      ]),
-      el("div", { className: "fold-body" + (manualEditorOpen ? "" : " hidden") }, video ? [
+      el("div", { className: "fold-body" }, video ? [
         el("div", { className: "sub section-note", textContent: "手动确认具有最高优先级，不会被初步分类或 AI 分类覆盖" }),
         el("div", { className: "preview manual-preview" }, [
           renderCover(video),
@@ -804,27 +1175,10 @@
             el("div", { className: "preview-meta", textContent: [video.upName, video.tname, video.bvid, formatDate(video.pubdate)].filter(Boolean).join(" · ") })
           ])
         ]),
-        el("div", { className: "check-list manual-category-list" }, flattenCategoriesInTree()
-          .map(({ category, level }) => el("label", {
-            className: "manual-cat-row manual-indent-" + Math.min(level, 4)
-          }, [
-            el("input", {
-              type: "checkbox",
-              value: category.id,
-              checked: selectedIds.has(category.id),
-              dataset: { role: "manual-category" }
-            }),
-            el("span", { className: "swatch", style: categoryStyle(category, "swatch") }),
-            el("span", { textContent: category.name })
-          ]))),
-        el("div", { className: "editor-actions" }, [
-          el("button", { className: "primary", dataset: { action: "save-manual", bvid: video.bvid }, textContent: "保存为手动确认" }),
-          el("button", { className: "ghost", dataset: { action: "filter-unclassified" }, textContent: "查看待精细分类" }),
-          el("button", { className: batchMode ? "primary" : "ghost", dataset: { action: "toggle-batch" }, textContent: batchMode ? "退出批量" : "批量管理" })
-        ])
+        renderCategoryChoices(selectedIds, "manual-category")
       ] : presentVideos().length ? [
         el("div", { className: "manual-editor-default" }, [
-          el("div", { className: "manual-editor-default-icon", textContent: "✓" }),
+          el("div", { className: "manual-editor-default-icon" }, [iconNode("check")]),
           el("h3", { textContent: "选择一种调整方式" }),
           el("p", { textContent: "点击中间的视频卡片可单独调整分类，或进入批量管理一次处理多个视频。" }),
           el("button", { className: "primary", dataset: { action: "toggle-batch" }, textContent: "批量管理" })
@@ -836,21 +1190,19 @@
   }
 
   function renderLlmAutomation() {
-    const settings = state.settings || {};
-    return el("section", { className: "fold llm-panel", dataset: { fold: "llm-panel" } }, [
-      el("button", { className: "fold-head", dataset: { action: "toggle-llm-panel" } }, [
-        el("h2", { textContent: "AI 批量视频分类" }),
-        el("span", { dataset: { role: "fold-icon" }, textContent: llmPanelOpen ? "⌃" : "⌄" })
-      ]),
-      el("div", { className: "fold-body" + (llmPanelOpen ? "" : " hidden") }, [
-        el("section", { className: "ai-method" }, [
+    const settings = Object.assign({}, state.settings || {}, llmFormDraft);
+    return el("section", { className: "settings-page", hidden: settingsPage !== "classify", dataset: { settingsPage: "classify", fold: "llm-panel" } }, [
+      settingsSectionHeader("AI 批量视频分类", "把待精细分类的视频分配到现有目录。手动确认的视频始终跳过。", "ai", aiMethod,
+        [["api", "使用 API 自动分类"], ["manual", "手动复制 Prompt"]]),
+      el("div", { className: "settings-page-body" }, [
+        el("section", { className: "ai-method settings-scroll", hidden: aiMethod !== "api", dataset: { settingsGroup: "ai", settingsValue: "api", scrollKey: "classify-api" } }, [
           el("div", { className: "ai-method-heading" }, [
             el("h3", { textContent: "使用 API 自动分类" }),
-            el("p", { textContent: apiSettingsReady(settings) ? "使用设置中已保存的 API；手动确认的视频始终跳过。" : "API 尚未设置完整，请先到“设置”中填写并测试。" })
+            el("p", { textContent: apiSettingsReady(settings) ? "使用设置中已保存的 API；手动确认的视频始终跳过。" : "API 尚未设置完整，请先到“API 与自动化 → API 设置”填写并测试。" })
           ]),
         el("div", { className: "llm-grid" }, [
-          labeledInput("每批数量", "llm-batch-size", settings.llmBatchSize || 50, "50", "number"),
-          labeledInput("本次数量", "llm-limit", settings.llmLimit || 0, "0 表示全部", "number")
+          labeledInput("每批处理视频数", "llm-batch-size", settings.llmBatchSize ?? 50, "50", "number"),
+          labeledInput("本次数量（0 表示全部）", "llm-limit", settings.llmLimit ?? 0, "0 表示全部", "number")
         ]),
         el("label", { className: "inline-check" }, [
           el("input", { type: "checkbox", checked: settings.llmIncludeAll === true, dataset: { role: "llm-include-all" } }),
@@ -862,15 +1214,15 @@
             ? el("button", { className: "danger", dataset: { action: "stop-llm-run" }, textContent: "停止" })
             : el("button", { className: "primary", dataset: { action: "start-llm-run" }, textContent: "使用 API 开始分类" })
         ]),
-        el("div", { className: "llm-progress" }, [
+        llmRun.running || llmRun.done || llmRun.message ? el("div", { className: "llm-progress" }, [
           el("div", { textContent: llmRun.message || "未运行" }),
           el("div", { textContent: "处理 " + (llmRun.processed || 0) + " / " + (llmRun.total || 0) + "，导入 " + (llmRun.imported || 0) + "，跳过 " + (llmRun.skipped || 0) + "，失败批次 " + failedBatchCount() }),
           llmRun.warnings && llmRun.warnings.length ? el("div", { textContent: "最近：" + llmRun.warnings[llmRun.warnings.length - 1] }) : null
-        ].filter(Boolean))
-        ]),
-        el("section", { className: "ai-method manual-ai-method" }, [
+        ].filter(Boolean)) : null
+        ].filter(Boolean)),
+        el("section", { className: "ai-method manual-ai-method settings-scroll", hidden: aiMethod !== "manual", dataset: { settingsGroup: "ai", settingsValue: "manual", scrollKey: "classify-manual" } }, [
           el("div", { className: "ai-method-heading" }, [
-            el("h3", { textContent: "手动导入/导出" }),
+            el("h3", { textContent: "手动复制 Prompt" }),
             el("p", { textContent: "复制 Prompt 给 ChatGPT、Gemini 或 DeepSeek，再把返回的 JSON 导入。" })
           ]),
           renderExchange()
@@ -905,7 +1257,7 @@
           el("div", { textContent: "默认导入会替换非手动确认结果；勾选追加时只追加命中的分类。" })
         ]),
         el("label", { className: "field" }, [
-          el("span", { textContent: "导出数量" }),
+          el("span", { textContent: "1. 选择视频数量并生成 Prompt" }),
           el("input", {
             type: "number",
             min: "0",
@@ -916,6 +1268,11 @@
             dataset: { role: "manual-export-limit" }
           })
         ]),
+        el("div", { className: "exchange-actions" }, [
+          el("button", { dataset: { action: "export" }, textContent: "生成 Prompt" }),
+          el("button", { dataset: { action: "copy-exchange" }, textContent: "复制 Prompt" })
+        ]),
+        el("h3", { className: "exchange-step", textContent: "2. 将 Prompt 交给 AI，再粘贴返回的 JSON" }),
         exchange.title ? el("div", { className: "exchange-title", textContent: exchange.title }) : null,
         el("textarea", { dataset: { role: "exchange-text" }, value: exchange.text, placeholder: "这里会显示导出的 Prompt；也可以粘贴 AI 返回的 JSON。" }),
         el("label", { className: "inline-check" }, [
@@ -923,54 +1280,72 @@
           text("导入时追加分类；结果记为 AI 分类")
         ]),
         el("div", { className: "exchange-actions" }, [
-          el("button", { dataset: { action: "export" }, textContent: "生成提示词" }),
-          el("button", { dataset: { action: "copy-exchange" }, textContent: "复制" }),
           el("button", { className: "ghost", dataset: { action: "prepare-import" }, textContent: "粘贴 JSON" }),
-          el("button", { className: "primary", dataset: { action: "import-json" }, textContent: "导入 JSON" }),
+          el("button", { className: "primary", dataset: { action: "import-json" }, textContent: "3. 导入视频分类结果" }),
           el("button", { className: "ghost", dataset: { action: "hide-exchange" }, textContent: "清空" })
         ])
       ].filter(Boolean));
   }
 
   function renderApiSettings() {
-    return el("section", { className: "fold settings-panel", dataset: { fold: "settings-panel" } }, [
-      el("button", { className: "fold-head", dataset: { action: "toggle-settings-panel" } }, [
-        el("h2", { textContent: "设置" }),
-        el("span", { dataset: { role: "fold-icon" }, textContent: settingsPanelOpen ? "⌃" : "⌄" })
-      ]),
-      el("div", { className: "fold-body settings-body" + (settingsPanelOpen ? "" : " hidden") }, [
-        renderApiSettingsSection(),
-        renderAutoLlmSettingsSection()
-      ])
+    const panels = [["api", renderApiSettingsSection], ["auto", renderAutoLlmSettingsSection], ["logs", renderOperationLogSection]];
+    return el("section", { className: "settings-page", hidden: settingsPage !== "preferences", dataset: { settingsPage: "preferences" } }, [
+      settingsSectionHeader("API 与自动化", "配置 AI 服务、安排自动分类，或查看历史操作。", "preferences", preferencesPage,
+        [["api", "API 设置"], ["auto", "自动分类"], ["logs", "操作日志"]]),
+      el("div", { className: "settings-page-body" }, panels.map(([value, render]) => el("div", {
+        className: "settings-scroll", hidden: preferencesPage !== value,
+        dataset: { settingsGroup: "preferences", settingsValue: value, scrollKey: "preferences-" + value }
+      }, [render()])))
     ]);
   }
 
   function renderApiSettingsSection() {
     const settings = Object.assign({}, state.settings || {}, apiSettingsDraft || {});
+    const useJev = settings.classificationProvider === "jev";
+    const providerName = useJev ? "Jev" : "OpenAI-compatible";
     return el("section", { className: "settings-subfold", dataset: { fold: "api-settings" } }, [
-      el("button", { className: "settings-subhead", dataset: { action: "toggle-api-settings" } }, [
-        el("h3", { textContent: "API 设置" }),
-        el("span", { dataset: { role: "fold-icon" }, textContent: apiSettingsOpen ? "⌃" : "⌄" })
-      ]),
-      el("div", { className: "settings-subbody" + (apiSettingsOpen ? "" : " hidden") }, [
-        el("div", { className: "api-settings-heading" }, [
-          el("p", { textContent: "分类目录生成和 AI 批量视频分类共用这里保存的 OpenAI-compatible API。" })
+      el("div", { className: "settings-subbody" }, [
+        el("label", { className: "field" }, [
+          el("span", { textContent: "视频分类使用的 API" }),
+          el("select", { disabled: apiTestState.running, dataset: { role: "classification-provider" } }, [
+            option("openai", "OpenAI-compatible", settings.classificationProvider || "openai"),
+            option("jev", "Jev（TypeSafe）", settings.classificationProvider || "openai")
+          ])
         ]),
-        el("div", { className: "llm-grid" }, [
-          labeledInput("API URL", "llm-base-url", settings.llmBaseUrl || "", "https://openrouter.ai/api/v1", "url"),
-          labeledInput("Model", "llm-model", settings.llmModel || "", "例如 openai/gpt-4.1-mini", "text"),
-          labeledInput("API Key", "llm-api-key", settings.llmApiKey || "", "sk-...", "password"),
-          labeledInput("温度", "llm-temperature", settings.llmTemperature == null ? 0.1 : settings.llmTemperature, "0.1", "number")
+        el("div", { className: "api-provider-summary" }, [
+          el("strong", { textContent: useJev ? "Jev · 专门做分类选择" : "OpenAI-compatible · 通用 AI 接口" }),
+          el("p", { textContent: useJev
+            ? "从现有目录中为每个视频选一个类别。只需 TypeSafe 密钥，模型默认可用；建议先试 5 个视频。"
+            : "支持 OpenRouter 等兼容服务。可给视频分配多个类别，也可生成分类目录。" })
         ]),
-        el("label", { className: "inline-check" }, [
-          el("input", { type: "checkbox", checked: settings.llmUseResponseFormat === true, dataset: { role: "llm-use-response-format" } }),
-          text("请求 JSON response_format")
+        el("div", { className: "api-provider-fields" + (useJev ? "" : " hidden"), dataset: { apiProvider: "jev" } }, [
+          el("div", { className: "llm-grid" }, [
+            labeledInput("TypeSafe API Key", "jev-api-key", settings.jevApiKey || "", "填写 TypeSafe 密钥", "password"),
+            labeledInput("模型", "jev-model", settings.jevModel || "jev-latest", "jev-latest", "text")
+          ]),
+          el("p", { className: "settings-help", textContent: "Jev 不生成分类目录。如需生成，请切换到 OpenAI-compatible 配置并保存，再切回 Jev。" })
         ]),
+        el("div", { className: "api-provider-fields" + (useJev ? " hidden" : ""), dataset: { apiProvider: "openai" } }, [
+          el("div", { className: "llm-grid" }, [
+            labeledInput("API 地址", "llm-base-url", settings.llmBaseUrl || "", "https://openrouter.ai/api/v1", "url"),
+            labeledInput("模型", "llm-model", settings.llmModel || "", "服务商提供的模型名称", "text"),
+            labeledInput("API Key", "llm-api-key", settings.llmApiKey || "", "填写服务商密钥", "password")
+          ]),
+          el("details", { className: "api-advanced" }, [
+            el("summary", { textContent: "高级选项（通常无需修改）" }),
+            labeledInput("温度", "llm-temperature", settings.llmTemperature == null ? 0.1 : settings.llmTemperature, "0.1", "number"),
+            el("label", { className: "inline-check" }, [
+              el("input", { type: "checkbox", checked: settings.llmUseResponseFormat === true, dataset: { role: "llm-use-response-format" } }),
+              text("请求 JSON response_format")
+            ])
+          ])
+        ]),
+        el("p", { className: "settings-help", textContent: "两种配置分别保留，切换不会清空。保存后，手动启动和定时视频分类都使用所选 API。" }),
         el("div", { className: "llm-actions" }, [
-          el("button", { className: "primary", dataset: { action: "save-llm-settings" }, textContent: "保存 API 设置" }),
-          el("button", { dataset: { action: "test-llm-api" }, textContent: apiTestState.running ? "正在测试…" : "测试 API" })
+          el("button", { className: "primary", disabled: apiTestState.running, dataset: { action: "save-llm-settings" }, textContent: "保存并使用 " + providerName }),
+          el("button", { disabled: apiTestState.running, dataset: { action: "test-llm-api" }, textContent: apiTestState.running ? "正在测试…" : "测试 " + providerName })
         ]),
-        apiTestState.message ? el("div", { className: "api-test-status", textContent: apiTestState.message }) : null
+        apiTestState.message ? renderFeedbackNotice("api-test-status", apiTestState.message) : null
       ].filter(Boolean))
     ]);
   }
@@ -979,11 +1354,7 @@
     const settings = Object.assign({}, state.settings || {}, autoApiSettingsDraft || {});
     const mode = settings.llmAutoClassifyMode || "off";
     return el("section", { className: "settings-subfold", dataset: { fold: "auto-api-settings" } }, [
-      el("button", { className: "settings-subhead", dataset: { action: "toggle-auto-api-settings" } }, [
-        el("h3", { textContent: "自动 API 视频分类" }),
-        el("span", { dataset: { role: "fold-icon" }, textContent: autoApiSettingsOpen ? "⌃" : "⌄" })
-      ]),
-      el("div", { className: "settings-subbody" + (autoApiSettingsOpen ? "" : " hidden") }, [
+      el("div", { className: "settings-subbody" }, [
         el("p", { className: "settings-help", textContent: "自动处理待精细分类的视频，手动确认始终跳过。浏览器需保持运行，实际触发时间可能稍有延迟。" }),
         el("label", { className: "field" }, [
           el("span", { textContent: "自动分类条件" }),
@@ -994,7 +1365,9 @@
             option("threshold", "待精细分类达到指定数量", mode)
           ])
         ]),
-        labeledInput("待精细分类达到数量（仅数量模式）", "llm-auto-classify-threshold", settings.llmAutoClassifyThreshold || 50, "50", "number"),
+        el("div", { hidden: mode !== "threshold", dataset: { role: "auto-threshold-field" } }, [
+          labeledInput("待精细分类达到多少个时运行", "llm-auto-classify-threshold", settings.llmAutoClassifyThreshold || 50, "50", "number")
+        ]),
         el("div", { className: "auto-api-status" }, [
           el("div", { textContent: "上次运行：" + formatSettingsTime(settings.llmAutoClassifyLastRunAt) }),
           el("div", { textContent: settings.llmAutoClassifyLastStatus || "尚未自动运行" })
@@ -1007,6 +1380,20 @@
   }
 
   function onClick(event) {
+    const categoryRow = event.target.closest(".cat-row");
+    if (categoryRow && event.detail > 0 && !categoryRow.contains(document.elementFromPoint(event.clientX, event.clientY))) {
+      // Pointer capture can emit a click on the pressed row even after release elsewhere.
+      event.preventDefault();
+      return;
+    }
+    const dialog = event.target.closest(".management-dialog");
+    if (event.target === dialog) {
+      const rect = dialog.getBoundingClientRect();
+      if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
+        closeModal();
+        return;
+      }
+    }
     const link = event.target.closest("a");
     if (link) return;
     const target = event.target.closest("[data-action]");
@@ -1020,7 +1407,21 @@
       return;
     }
     const action = target.dataset.action;
-    if (action === "retry-onboarding-login") {
+    if (action === "open-management") {
+      manualEditorOpen = false;
+      managementOpen = true;
+      renderEditorOnly();
+    } else if (action === "select-settings-page") {
+      selectSettingsPage(target.dataset.page);
+    } else if (action === "select-settings-tab") {
+      rememberSettingsScroll();
+      if (target.dataset.group === "ai") aiMethod = target.dataset.value;
+      if (target.dataset.group === "directory") directoryMode = target.dataset.value;
+      if (target.dataset.group === "preferences") preferencesPage = target.dataset.value;
+      updateSettingsNavigation();
+    } else if (action === "close-modal") {
+      closeModal();
+    } else if (action === "retry-onboarding-login") {
       checkOnboardingLoginAndSync();
     } else if (action === "choose-onboarding-method") {
       chooseOnboardingMethod(target.dataset.method);
@@ -1055,17 +1456,20 @@
       completeOnboarding("首次引导已完成，所有分类方式仍可随时使用");
     } else if (action === "filter-all") {
       activeFilter = { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" };
-      renderShell();
+      updateCategorySelection(target);
+      renderVideoResults("category");
     } else if (action === "filter-unclassified") {
+      if (manualEditorOpen) closeModal();
       activeFilter = { categoryIds: [], includeUnclassified: true, includeRemoved: false, sourceCategoryId: "" };
-      renderShell();
+      updateCategorySelection(target);
+      renderVideoResults("category");
     } else if (action === "filter-category") {
-      if (suppressCategoryClick) return;
       const categoryId = target.dataset.categoryId;
       activeFilter = activeFilter.sourceCategoryId === categoryId
         ? { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" }
         : { categoryIds: expandCategoryIds([categoryId]), includeUnclassified: false, includeRemoved: false, sourceCategoryId: categoryId };
-      renderShell();
+      updateCategorySelection(target);
+      renderVideoResults("category");
     } else if (action === "select-video") {
       if (suppressNextCardClick) {
         suppressNextCardClick = false;
@@ -1078,11 +1482,16 @@
         renderEditorOnly();
       } else {
         selectedBvid = target.dataset.bvid;
+        manualCategoryDraft = null;
+        managementOpen = false;
         manualEditorOpen = true;
         updateSelectedVideoUi();
         renderEditorOnly();
       }
     } else if (action === "toggle-batch") {
+      managementOpen = false;
+      manualEditorOpen = false;
+      manualCategoryDraft = null;
       batchMode = !batchMode;
       if (!batchMode) selectedBvids = new Set();
       renderShell();
@@ -1108,24 +1517,8 @@
       startLlmRun();
     } else if (action === "stop-llm-run") {
       stopLlmRun();
-    } else if (action === "toggle-manual-editor") {
-      manualEditorOpen = !manualEditorOpen;
-      toggleFoldNode("manual-editor", manualEditorOpen);
-    } else if (action === "toggle-llm-panel") {
-      llmPanelOpen = !llmPanelOpen;
-      toggleFoldNode("llm-panel", llmPanelOpen);
-    } else if (action === "toggle-settings-panel") {
-      settingsPanelOpen = !settingsPanelOpen;
-      toggleFoldNode("settings-panel", settingsPanelOpen);
-    } else if (action === "toggle-api-settings") {
-      apiSettingsOpen = !apiSettingsOpen;
-      toggleFoldNode("api-settings", apiSettingsOpen);
-    } else if (action === "toggle-auto-api-settings") {
-      autoApiSettingsOpen = !autoApiSettingsOpen;
-      toggleFoldNode("auto-api-settings", autoApiSettingsOpen);
-    } else if (action === "toggle-category-admin") {
-      categoryAdminOpen = !categoryAdminOpen;
-      toggleFoldNode("category-admin", categoryAdminOpen);
+    } else if (action === "shuffle-videos") {
+      shuffleVideos();
     } else if (action === "sync-refresh") {
       syncAndRefresh();
     } else if (action === "scan") {
@@ -1147,6 +1540,12 @@
     } else if (action === "hide-exchange") {
       exchange = { visible: false, title: "", text: "", append: exchange.append, mode: "import" };
       renderEditorOnly();
+    } else if (action === "toggle-category-add") {
+      categoryAddOpen = !categoryAddOpen;
+      const form = document.querySelector('[data-role="category-add-form"]');
+      if (form) form.hidden = !categoryAddOpen;
+      target.setAttribute("aria-expanded", String(categoryAddOpen));
+      target.textContent = categoryAddOpen ? "收起添加" : "添加类别";
     } else if (action === "add-category") {
       addCategory();
     } else if (action === "delete-category") {
@@ -1181,7 +1580,8 @@
   async function chooseOnboardingMethod(methodValue) {
     const methodName = ["categories", "api", "prompt"].includes(methodValue) ? methodValue : "categories";
     onboardingPanelDismissed = methodName === "categories";
-    if (methodName === "categories") categoryAdminOpen = true;
+    if (methodName === "categories") { settingsPage = "directory";
+    directoryMode = "edit"; managementOpen = true; }
     try {
       await updateOnboardingSettings({ onboardingStage: "setup-" + methodName, onboardingMethod: methodName });
       if (methodName === "categories") revealOnboardingPanel(methodName);
@@ -1208,6 +1608,8 @@
   }
 
   async function backToOnboardingGuide() {
+    managementOpen = false;
+    manualEditorOpen = false;
     onboardingPanelDismissed = false;
     try {
       await updateOnboardingSettings({ onboardingStage: "guide" });
@@ -1235,9 +1637,9 @@
   async function saveOnboardingApi() {
     if (onboardingCategoryRunning) return;
     const config = Object.assign({}, state.settings || {});
-    if (!apiSettingsReady(config)) {
+    if (!categoryApiSettingsReady(config)) {
       openOnboardingApiSettings();
-      setStatus("API 尚未设置完整，请先在“设置”中填写并测试 API");
+      setStatus("生成分类目录需要 OpenAI-compatible API，请先填写并保存地址、模型和密钥");
       return;
     }
     setStatus("正在让 AI 生成新的分类目录…");
@@ -1261,9 +1663,11 @@
   }
 
   function openOnboardingApiSettings() {
+    managementOpen = true;
+    manualEditorOpen = false;
     onboardingPanelDismissed = true;
-    settingsPanelOpen = true;
-    apiSettingsOpen = true;
+    settingsPage = "preferences";
+    preferencesPage = "api";
     renderShell();
   }
 
@@ -1326,14 +1730,18 @@
 
   function reopenOnboardingCategories() {
     onboardingPanelDismissed = true;
-    categoryAdminOpen = true;
+    settingsPage = "directory";
+    directoryMode = "edit";
+    managementOpen = true;
     renderShell();
     revealOnboardingPanel("categories");
   }
 
   async function adjustOnboardingCategoryResult() {
     onboardingPanelDismissed = true;
-    categoryAdminOpen = true;
+    settingsPage = "directory";
+    directoryMode = "edit";
+    managementOpen = true;
     try {
       await updateOnboardingSettings({ onboardingStage: "setup-categories" });
       revealOnboardingPanel("categories");
@@ -1344,15 +1752,8 @@
   }
 
   function revealOnboardingPanel(methodName) {
-    const foldName = methodName === "categories"
-      ? "category-admin"
-        : methodName === "manual"
-          ? "manual-editor"
-          : "llm-panel";
-    setTimeout(() => {
-      const node = document.querySelector('[data-fold="' + foldName + '"]');
-      if (node) node.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 0);
+    if (methodName !== "manual") selectSettingsPage(methodName === "categories" ? "directory" : "classify",
+      methodName === "categories" ? "edit" : methodName === "prompt" ? "manual" : "api");
   }
 
   async function showOnboardingGuide() {
@@ -1367,11 +1768,15 @@
   async function startOnboardingClassification(modeValue) {
     const modeName = ["manual", "prompt", "api"].includes(modeValue) ? modeValue : "manual";
     onboardingPanelDismissed = true;
-    if (modeName === "manual") manualEditorOpen = true;
-    if (modeName === "prompt" || modeName === "api") llmPanelOpen = true;
+    managementOpen = modeName !== "manual";
+    if (modeName === "manual") {
+      manualEditorOpen = true;
+      selectedBvid = presentVideos()[0]?.bvid || "";
+    }
+    if (modeName === "prompt" || modeName === "api") { settingsPage = "classify"; aiMethod = modeName === "prompt" ? "manual" : "api"; }
     if (modeName === "api" && !apiSettingsReady(state.settings || {})) {
-      settingsPanelOpen = true;
-      apiSettingsOpen = true;
+      settingsPage = "preferences";
+      preferencesPage = "api";
     }
     try {
       await updateOnboardingSettings({ onboardingStage: "classify" });
@@ -1421,114 +1826,24 @@
     }
   }
 
-  function onDragStart(event) {
-    const group = event.target.closest(".category-tree-group[data-category-group]");
-    if (!group || !group.draggable) return;
-    draggedCategoryId = group.dataset.categoryGroup || "";
-    dragDropPosition = "before";
-    suppressCategoryClick = true;
-    group.classList.add("dragging");
-    if (event.dataTransfer) {
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", draggedCategoryId);
-      event.dataTransfer.setDragImage(group, 18, 18);
-    }
-  }
-
-  function onDragOver(event) {
-    const group = categoryDropTargetGroup(event.target, draggedCategoryId);
-    if (!group || !draggedCategoryId || group.dataset.categoryGroup === draggedCategoryId) return;
-    if (!canDropCategory(draggedCategoryId, group.dataset.categoryGroup)) return;
-    event.preventDefault();
-    dragDropPosition = categoryDropPosition(group, event.clientY);
-    document.querySelectorAll(".drop-before,.drop-after").forEach((node) => {
-      if (node !== group) node.classList.remove("drop-before", "drop-after");
-    });
-    group.classList.toggle("drop-before", dragDropPosition === "before");
-    group.classList.toggle("drop-after", dragDropPosition === "after");
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  }
-
-  async function onDrop(event) {
-    const group = categoryDropTargetGroup(event.target, draggedCategoryId);
-    if (!group || !draggedCategoryId) return;
-    const targetId = group.dataset.categoryGroup || "";
-    const position = categoryDropPosition(group, event.clientY);
-    clearDragClasses();
-    if (!targetId || targetId === draggedCategoryId || !canDropCategory(draggedCategoryId, targetId)) {
-      draggedCategoryId = "";
-      releaseCategoryClickSuppression();
-      return;
-    }
-    event.preventDefault();
-    setStatus("正在调整分类顺序...");
-    try {
-      updateState(await send({
-        type: message.REORDER_CATEGORY,
-        id: draggedCategoryId,
-        targetId,
-        position
-      }));
-      setStatus("已调整分类顺序；未触发视频同步或重新分类");
-    } catch (error) {
-      setStatus("排序失败：" + error.message);
-    } finally {
-      draggedCategoryId = "";
-      releaseCategoryClickSuppression();
-    }
-  }
-
-  function onDragEnd() {
-    clearDragClasses();
-    draggedCategoryId = "";
-    releaseCategoryClickSuppression();
-  }
-
-  function releaseCategoryClickSuppression() {
-    setTimeout(() => {
-      suppressCategoryClick = false;
-    }, 120);
-  }
-
-  function clearDragClasses() {
-    document.querySelectorAll(".dragging,.drop-before,.drop-after").forEach((node) => {
-      node.classList.remove("dragging", "drop-before", "drop-after");
-    });
-  }
-
-  function categoryDropTargetGroup(target, draggedId) {
-    const dragged = state.categories.find((item) => item.id === draggedId);
-    let group = target && target.closest ? target.closest(".category-tree-group[data-category-group]") : null;
-    while (group && dragged) {
-      const category = state.categories.find((item) => item.id === group.dataset.categoryGroup);
-      if (category && (category.parentId || "") === (dragged.parentId || "")) return group;
-      group = group.parentElement && group.parentElement.closest(".category-tree-group[data-category-group]");
-    }
-    return null;
-  }
-
-  function categoryDropPosition(group, clientY) {
-    const row = Array.from(group.children).find((child) => child.classList && child.classList.contains("cat-row"));
-    if (!row) return "before";
-    const rect = row.getBoundingClientRect();
-    return clientY < rect.top + rect.height / 2 ? "before" : "after";
-  }
-
-  function canDropCategory(id, targetId) {
-    const category = state.categories.find((item) => item.id === id);
-    const target = state.categories.find((item) => item.id === targetId);
-    return Boolean(category && target && (category.parentId || "") === (target.parentId || ""));
-  }
-
   function onInput(event) {
+    const inputRole = event.target.dataset.role;
+    if (inputRole === "new-category-name") newCategoryDraft.name = event.target.value;
+    if (["llm-batch-size", "llm-limit", "llm-include-all"].includes(inputRole)) {
+      llmFormDraft = { llmBatchSize: numberByRole("llm-batch-size", 50), llmLimit: numberByRole("llm-limit", 0), llmIncludeAll: checkedByRole("llm-include-all") };
+    }
     if (event.target.dataset.role === "search") {
       searchText = event.target.value;
-      renderVideoResults();
+      updateSearchSurface();
+      clearTimeout(searchTimer);
+      if (!searchComposing && !event.isComposing) {
+        searchTimer = setTimeout(() => renderVideoResults("search"), 100);
+      }
     } else if (event.target.dataset.role === "exchange-text") {
       exchange.text = event.target.value;
     } else if (event.target.dataset.role === "category-prompt-import") {
       categoryGeneration.importText = event.target.value;
-    } else if (["llm-base-url", "llm-model", "llm-api-key", "llm-temperature", "llm-use-response-format"].includes(event.target.dataset.role)) {
+    } else if (["classification-provider", "jev-model", "jev-api-key", "llm-base-url", "llm-model", "llm-api-key", "llm-temperature", "llm-use-response-format"].includes(event.target.dataset.role)) {
       apiSettingsDraft = collectApiSettings();
     } else if (event.target.dataset.role === "llm-auto-classify-threshold") {
       autoApiSettingsDraft = collectAutoLlmSettings();
@@ -1536,6 +1851,11 @@
       const category = ensureCategoryDraft().find((item) => item.id === event.target.dataset.categoryId);
       if (category) category.name = event.target.value;
       categoryDraftDirty = true;
+      const draftStatus = document.querySelector('[data-role="category-draft-status"]');
+      if (draftStatus) {
+        draftStatus.textContent = "有未保存修改";
+        draftStatus.classList.add("is-dirty");
+      }
     }
   }
 
@@ -1608,14 +1928,6 @@
   }
 
   function onWheel(event) {
-    if (draggedCategoryId) {
-      const categoryNav = document.querySelector(".cat-nav");
-      if (categoryNav && event.deltaY) {
-        categoryNav.scrollTop += event.deltaY;
-        event.preventDefault();
-      }
-      return;
-    }
     if (!selectionBox || !selectionBox.hasMoved) return;
     scheduleSelectionScrollUpdate();
   }
@@ -1667,7 +1979,7 @@
       const selected = selectedBvids.has(card.dataset.bvid);
       card.classList.toggle("batch-selected", selected);
       const mark = card.querySelector(".select-mark");
-      if (mark) mark.textContent = selected ? "✓" : "";
+      if (mark) mark.replaceChildren(...(selected ? [iconNode("check")] : []));
     });
     updateBatchCounts();
   }
@@ -1701,12 +2013,6 @@
 
   function batchEditorCountText() {
     return "已选择 " + selectedBvids.size + " 个视频";
-  }
-
-  function updateBatchCategorySwatch() {
-    const category = state.categories.find((item) => item.id === batchCategoryId);
-    const swatch = document.querySelector('[data-role="batch-category-swatch"]');
-    if (category && swatch) swatch.setAttribute("style", categoryStyle(category, "swatch"));
   }
 
   function updateSelectionPoint(clientX, clientY) {
@@ -1773,13 +2079,26 @@
 
   function onChange(event) {
     const role = event.target.dataset.role;
-    if (role === "video-filter") {
+    if (role === "new-category-parent") newCategoryDraft.parent = event.target.value;
+    if (role === "llm-include-all") llmFormDraft.llmIncludeAll = event.target.checked;
+    if (role === "classification-provider") {
+      apiSettingsDraft = collectApiSettings();
+      apiTestState = { running: false, message: "" };
+      renderEditorOnly();
+      const selector = document.querySelector('[data-role="classification-provider"]');
+      if (selector) selector.focus({ preventScroll: true });
+    } else if (role === "video-filter") {
       videoFilter = event.target.value;
-      renderShell();
+      renderVideoResults("filter");
     } else if (role === "sort-combo") {
+      if (event.target.value === "random") {
+        shuffleVideos();
+        return;
+      }
+      const request = ++sortRequest;
       const parsed = parseSortCombo(event.target.value);
       send({ type: message.UPDATE_SETTINGS, settings: parsed })
-        .then(updateState)
+        .then((nextState) => { if (request !== sortRequest) return; randomOrder = null; updateState(nextState, { animateCards: true, reflowDuration: 480 }); })
         .catch((error) => setStatus(error.message));
     } else if (role === "sort-mode") {
       send({ type: message.UPDATE_SETTINGS, settings: { sortMode: event.target.value } })
@@ -1797,9 +2116,13 @@
         .catch((error) => setStatus(error.message));
     } else if (role === "llm-auto-classify-mode") {
       autoApiSettingsDraft = collectAutoLlmSettings();
+      const threshold = document.querySelector('[data-role="auto-threshold-field"]');
+      if (threshold) threshold.hidden = event.target.value !== "threshold";
     } else if (role === "batch-category") {
-      batchCategoryId = event.target.value;
-      updateBatchCategorySwatch();
+      if (event.target.checked) batchCategoryIds.add(event.target.value);
+      else batchCategoryIds.delete(event.target.value);
+    } else if (role === "category-name") {
+      renderEditorOnly();
     } else if (role === "category-parent") {
       harvestCategoryDraft();
       categoryDraftDirty = true;
@@ -1807,32 +2130,237 @@
     }
   }
 
-  function renderVideoResults() {
+  function renderVideoResults(reason = "filter") {
+    clearTimeout(searchTimer);
+    resultExitLayer?.remove();
+    resultExitLayer = null;
     const content = document.querySelector('[data-role="content"]');
-    if (content) content.replaceWith(renderContent(visibleVideos()));
+    if (!content) return;
+    const previous = captureCardPositions();
+    const main = document.querySelector(".main");
+    const scrollTop = main.scrollTop;
+    const visible = visibleVideos();
+    const viewport = resultViewport(main);
+    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      animateResultExit(visible, viewport);
+    }
+    const next = renderContent(visible);
+    content.replaceWith(next);
+    main.scrollTop = scrollTop;
+    const shuffle = document.querySelector('[data-action="shuffle-videos"]');
+    if (shuffle) shuffle.disabled = visible.length < 2;
+    updateSearchSurface();
+    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      const cards = new Map();
+      let entering = 0;
+      next.querySelectorAll(".video-card[data-bvid]").forEach(card => {
+        const after = card.getBoundingClientRect();
+        if (after.bottom < viewport.top || after.top > viewport.bottom) return;
+        const plan = resultCardPlan(previous.get(card.dataset.bvid), after, viewport);
+        plan.delay = plan.entering ? 60 + Math.min(entering++, 5) * 22 : 0;
+        cards.set(card.dataset.bvid, plan);
+      });
+      resultTransition = { startedAt: Date.now(), duration: 590, cards };
+      resumeResultTransition(next);
+    } else {
+      resultTransition = null;
+    }
     updateStatusSurface();
   }
 
-  function renderEditorOnly() {
-    const editor = document.querySelector(".editor");
-    if (!editor) return;
-    const scrollTop = editor.scrollTop;
-    editor.replaceWith(renderEditor(visibleVideos()));
-    const nextEditor = document.querySelector(".editor");
-    if (nextEditor) nextEditor.scrollTop = scrollTop;
+  function resultViewport(main) {
+    const rect = main.getBoundingClientRect();
+    const bar = main.querySelector(".topbar")?.getBoundingClientRect();
+    return { left: rect.left, right: rect.right, width: rect.width,
+      top: Math.max(rect.top, bar?.bottom || rect.top), bottom: Math.min(rect.bottom, window.innerHeight),
+      height: Math.max(0, Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, bar?.bottom || rect.top)) };
   }
 
-  function toggleFoldNode(name, open) {
-    const section = document.querySelector('[data-fold="' + name + '"]');
-    if (!section) {
-      renderEditorOnly();
+  function resultCardPlan(before, after, viewport) {
+    const close = before && before.bottom >= viewport.top && before.top <= viewport.bottom
+      && Math.abs(before.left - after.left) < Math.max(280, viewport.width * .6)
+      && Math.abs(before.top - after.top) < Math.max(240, viewport.height * .6);
+    return close ? { entering: false, duration: 400, frames: [
+      { opacity: .85, transform: `translate(${before.left - after.left}px, ${before.top - after.top}px)` },
+      { opacity: 1, transform: "translate(0,0)" }
+    ] } : { entering: true, duration: 400, frames: [
+      { opacity: 0, transform: "translateY(18px) scale(.985)" },
+      { opacity: 1, transform: "translateY(0) scale(1)" }
+    ] };
+  }
+
+  function animateResultExit(visible, viewport) {
+    const keep = new Set(visible.map(video => video.bvid));
+    const layer = el("div", { className: "result-exit-layer", "aria-hidden": "true", inert: "",
+      style: `left:${viewport.left}px;top:${viewport.top}px;width:${viewport.width}px;height:${viewport.height}px` });
+    document.querySelectorAll(".video-card[data-bvid]").forEach(card => {
+      if (keep.has(card.dataset.bvid)) return;
+      const rect = card.getBoundingClientRect();
+      if (rect.bottom < viewport.top || rect.top > viewport.bottom) return;
+      const ghost = card.cloneNode(true);
+      ghost.removeAttribute("data-bvid");
+      ghost.removeAttribute("data-action");
+      ghost.style.cssText = `position:absolute;left:${rect.left - viewport.left}px;top:${rect.top - viewport.top}px;width:${rect.width}px;height:${rect.height}px;margin:0;animation:none;opacity:${getComputedStyle(card).opacity}`;
+      layer.appendChild(ghost);
+    });
+    if (!layer.children.length) return;
+    app.appendChild(layer);
+    resultExitLayer = layer;
+    const animation = layer.animate([{ opacity: 1, transform: "translateY(0)" }, { opacity: 0, transform: "translateY(-8px)" }],
+      { duration: 150, easing: "ease-out" });
+    animation.finished.then(() => layer.remove(), () => layer.remove());
+  }
+
+  function resumeResultTransition(content) {
+    if (!resultTransition || !content) return;
+    const elapsed = Date.now() - resultTransition.startedAt;
+    if (elapsed >= resultTransition.duration || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      resultTransition = null;
       return;
     }
-    const body = Array.from(section.children).find((child) => child.classList && (child.classList.contains("fold-body") || child.classList.contains("settings-subbody")));
-    const head = section.firstElementChild;
-    const icon = head && head.querySelector('[data-role="fold-icon"]');
-    if (body) body.classList.toggle("hidden", !open);
-    if (icon) icon.textContent = open ? "⌃" : "⌄";
+    content.querySelectorAll(".video-card[data-bvid]").forEach(card => {
+      const plan = resultTransition.cards.get(card.dataset.bvid);
+      if (!plan || elapsed >= plan.duration + plan.delay) return;
+      const animation = card.animate(plan.frames, { duration: plan.duration, delay: plan.delay,
+        fill: "backwards", easing: "cubic-bezier(.2,.75,.25,1)" });
+      animation.currentTime = elapsed;
+    });
+    const heading = content.querySelector(".list-head");
+    const empty = content.querySelector(".empty");
+    [heading, empty].filter(Boolean).forEach(node => {
+      if (elapsed >= 240) return;
+      const animation = node.animate([{ opacity: .3, transform: "translateY(5px)" }, { opacity: 1, transform: "translateY(0)" }],
+        { duration: 240, easing: "ease-out" });
+      animation.currentTime = elapsed;
+    });
+  }
+
+  function updateSearchSurface() {
+    const active = Boolean(searchText.trim());
+    const input = document.querySelector('[data-role="search"]');
+    if (!input) return;
+    const hint = document.getElementById("search-scope-hint");
+    if (hint) hint.hidden = !active;
+  }
+
+  function ensureRowAura(row) {
+    clearTimeout(auraCleanup.get(row));
+    if (!row.querySelector(".category-aura")) {
+      row.prepend(renderCategoryAura(row.dataset.auraSize, row.dataset.categoryId || (row.dataset.action === "filter-all" ? "all" : "pending")));
+      globalThis.BiliWLAura.refresh();
+    }
+  }
+
+  function releaseRowAura(row) {
+    clearTimeout(auraCleanup.get(row));
+    auraCleanup.set(row, setTimeout(() => {
+      if (!row.isConnected || row.classList.contains("active") || row.classList.contains("aura-preview")) return;
+      row.querySelector(".category-aura")?.remove();
+      globalThis.BiliWLAura.refresh();
+    }, 450));
+  }
+
+  function onCategoryPreview(event) {
+    const row = event.target.closest(".cat-row");
+    if (!row || (event.relatedTarget && row.contains(event.relatedTarget))) return;
+    const preview = event.type === "pointerover" || row.matches(":hover, :focus-visible");
+    if (preview) {
+      ensureRowAura(row);
+      // Draw the initial transparent state before beginning the fade.
+      row.getBoundingClientRect();
+      row.classList.add("aura-preview");
+    } else {
+      row.classList.remove("aura-preview");
+      releaseRowAura(row);
+    }
+  }
+
+  function reconcileCategoryPointer(event) {
+    if (event.type === "pointermove" && !event.buttons) return;
+    const hit = document.elementFromPoint(event.clientX, event.clientY);
+    document.querySelectorAll(".cat-row.aura-preview").forEach(row => {
+      // A pointer press leaves DOM focus behind; only visible keyboard focus counts.
+      if ((hit && row.contains(hit)) || row.matches(":focus-visible")) return;
+      row.classList.remove("aura-preview");
+      releaseRowAura(row);
+    });
+  }
+
+  function clearCategoryPreviews() {
+    document.querySelectorAll(".cat-row.aura-preview").forEach(row => {
+      row.classList.remove("aura-preview");
+      releaseRowAura(row);
+    });
+  }
+
+  function ensureCategoryGlass() {
+    moveCategoryGlass();
+  }
+
+  function moveCategoryGlass(target = null, animate = false) {
+    const rows = Array.from(document.querySelectorAll(".cat-row.active"));
+    let glass = document.querySelector(".category-glass");
+    const before = glass?.getBoundingClientRect();
+    const nav = document.querySelector(".cat-nav");
+    const viewport = nav?.getBoundingClientRect();
+    const visible = rows.filter(row => {
+      if (!row.closest(".cat-nav")) return true;
+      const rect = row.getBoundingClientRect();
+      return viewport && rect.bottom > viewport.top && rect.top < viewport.bottom;
+    });
+    const anchor = target?.getBoundingClientRect().top ?? before?.top ?? viewport?.top ?? 0;
+    const destination = visible.includes(target) ? target
+      : visible.includes(glass?.parentElement) ? glass.parentElement
+      : visible.sort((a, b) => Math.abs(a.getBoundingClientRect().top - anchor) - Math.abs(b.getBoundingClientRect().top - anchor))[0];
+    if (!destination) {
+      if (glass) glass.hidden = true;
+      return;
+    }
+    if (glass?.parentElement === destination && !glass.hidden) return;
+    if (!glass) glass = el("span", { className: "category-glass", "aria-hidden": "true" });
+    const wasHidden = glass.hidden;
+    glass.getAnimations().forEach(animation => animation.cancel());
+    glass.hidden = false;
+    destination.appendChild(glass);
+    const after = destination.getBoundingClientRect();
+    if (!animate || !before || wasHidden || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    glass.animate([
+      { transform: `translate(${before.left - after.left}px, ${before.top - after.top}px)`, width: before.width + "px", height: before.height + "px" },
+      { transform: "translate(0,0)", width: after.width + "px", height: after.height + "px" }
+    ], { duration: 560, easing: "cubic-bezier(.25,.65,.25,1)" });
+  }
+
+  function updateCategorySelection(target) {
+    document.querySelectorAll(".cat-row").forEach(row => {
+      const active = activeFilter.sourceCategoryId ? row.dataset.categoryId === activeFilter.sourceCategoryId
+        : activeFilter.includeUnclassified ? row.dataset.action === "filter-unclassified" : row.dataset.action === "filter-all";
+      row.classList.toggle("active", active);
+      row.setAttribute("aria-current", String(active));
+      if (active) ensureRowAura(row);
+      else releaseRowAura(row);
+    });
+    moveCategoryGlass(target.closest(".cat-row"), true);
+    globalThis.BiliWLAura.refresh();
+  }
+
+  function renderEditorOnly() {
+    const host = document.querySelector(".modal-host");
+    if (!host) return;
+    captureModalDraft();
+    rememberSettingsScroll();
+    const editor = host.querySelector(".editor");
+    const scrollTop = editor?.scrollTop || 0;
+    const directoryScrollTop = editor?.querySelector(".category-admin-list")?.scrollTop || 0;
+    const modalFocus = captureModalFocus();
+    host.replaceWith(renderEditor());
+    showModal();
+    const nextEditor = document.querySelector(".editor");
+    if (nextEditor) nextEditor.scrollTop = scrollTop;
+    const nextDirectory = nextEditor?.querySelector(".category-admin-list");
+    if (nextDirectory) nextDirectory.scrollTop = directoryScrollTop;
+    restoreModalFocus(modalFocus);
+    updateStatusSurface();
+    globalThis.BiliWLAura.refresh();
   }
 
   function toggleSelectedBvid(bvid) {
@@ -1843,9 +2371,13 @@
   }
 
   async function bulkAddCategory() {
-    const select = document.querySelector('[data-role="batch-category"]');
-    if (!select) return;
-    await bulkUpdate({ action: "add", categoryId: select.value });
+    const validIds = new Set(state.categories.filter(category => category.enabled !== false).map(category => category.id));
+    const categoryIds = Array.from(batchCategoryIds).filter(id => validIds.has(id));
+    if (!categoryIds.length) {
+      setStatus("请先勾选要添加的分类");
+      return;
+    }
+    await bulkUpdate({ action: "add", categoryIds });
   }
 
   async function bulkClearCategories() {
@@ -2017,7 +2549,8 @@
         append: result.mergeMode === "append",
         mode: "export"
       };
-      llmPanelOpen = true;
+      settingsPage = "classify";
+    aiMethod = "manual";
       renderEditorOnly();
       setStatus("已生成 " + (result.batchSize || 0) + " 个待精细分类视频的提示词，候选共 " + (result.totalCandidates || 0) + " 个");
     } catch (error) {
@@ -2033,7 +2566,8 @@
       append: false,
       mode: "import"
     };
-    llmPanelOpen = true;
+    settingsPage = "classify";
+    aiMethod = "manual";
     renderEditorOnly();
   }
 
@@ -2068,6 +2602,9 @@
 
   function collectApiSettings() {
     return {
+      classificationProvider: valueByRole("classification-provider") || "openai",
+      jevModel: valueByRole("jev-model"),
+      jevApiKey: valueByRole("jev-api-key"),
       llmBaseUrl: valueByRole("llm-base-url"),
       llmModel: valueByRole("llm-model"),
       llmApiKey: valueByRole("llm-api-key"),
@@ -2092,12 +2629,18 @@
   }
 
   function apiSettingsReady(config) {
+    return core.classificationApiReady(config);
+  }
+
+  function categoryApiSettingsReady(config) {
     return Boolean(core.normalizeText(config && config.llmBaseUrl) && core.normalizeText(config && config.llmModel) && core.normalizeText(config && config.llmApiKey));
   }
 
   function openApiSettings(statusMessage) {
-    settingsPanelOpen = true;
-    apiSettingsOpen = true;
+    managementOpen = true;
+    manualEditorOpen = false;
+    settingsPage = "preferences";
+    preferencesPage = "api";
     renderEditorOnly();
     if (statusMessage) setStatus(statusMessage);
   }
@@ -2107,13 +2650,13 @@
     try {
       const config = collectApiSettings();
       if (!apiSettingsReady(config)) {
-        setStatus("请完整填写 API URL、Model 和 API Key 后再保存");
+        setStatus("请完整填写所选视频分类服务的模型和密钥；OpenAI-compatible 还需要 API URL");
         return;
       }
       const nextState = await send({ type: message.UPDATE_SETTINGS, settings: config });
       apiSettingsDraft = null;
       updateState(nextState);
-      setStatus("已保存 AI API 配置");
+      setStatus("已保存，视频分类将使用 " + (config.classificationProvider === "jev" ? "Jev" : "OpenAI-compatible"));
     } catch (error) {
       setStatus("保存 AI API 配置失败：" + error.message);
     }
@@ -2141,7 +2684,7 @@
     if (apiTestState.running) return;
     const config = collectApiSettings();
     if (!apiSettingsReady(config)) {
-      apiTestState = { running: false, message: "请先完整填写 API URL、Model 和 API Key。" };
+      apiTestState = { running: false, message: "请先完整填写所选视频分类服务的配置。" };
       renderEditorOnly();
       setStatus("API 尚未设置完整，请先填写必填项");
       return;
@@ -2150,13 +2693,21 @@
     apiTestState = { running: true, message: "正在发送最小测试请求…" };
     renderEditorOnly();
     try {
+      if (config.classificationProvider === "jev") {
+        await core.classifyWithJev(config, [{ bvid: "test", title: "数学入门课程" }], [
+          { id: "study", name: "学习", enabled: true }, { id: "other.todo", name: "暂未归类", enabled: true }
+        ], fetchWithTimeout);
+        apiTestState = { running: false, message: "Jev 测试通过。点击“保存并使用 Jev”使配置生效。" };
+        setStatus("Jev API 测试通过");
+        return;
+      }
       const response = await sendLlmRequest(config, "请只回复一个简短的 JSON 对象：{\"ok\":true}", false, 30000);
       const textValue = await response.text();
       if (!response.ok) throw new Error("HTTP " + response.status + ": " + textValue.slice(0, 240));
       const data = parseJsonObject(textValue);
       const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
       if (!core.normalizeText(content)) throw new Error("响应缺少 choices[0].message.content");
-      apiTestState = { running: false, message: "测试通过。当前 API 可以正常响应；如有修改，请点击“保存 API 设置”。" };
+      apiTestState = { running: false, message: "OpenAI-compatible 测试通过。点击“保存并使用 OpenAI-compatible”使配置生效。" };
       setStatus("API 测试通过");
     } catch (error) {
       apiTestState = { running: false, message: "测试失败：" + error.message + "。请检查地址、模型、密钥或服务余额。" };
@@ -2193,7 +2744,8 @@
       batches: [],
       warnings: []
     };
-    llmPanelOpen = true;
+    settingsPage = "classify";
+    aiMethod = "api";
     renderEditorOnly();
 
     try {
@@ -2205,16 +2757,12 @@
       updateState(await send({ type: message.GET_STATE }));
       if (llmRun.imported) await finishClassificationAndSync("AI (API) 批量视频分类已更新");
       if (failed) {
-        settingsPanelOpen = true;
-        apiSettingsOpen = true;
         setStatus(llmRun.message + "：导入 " + llmRun.imported + " 项；请先在“设置”中检查并测试 API");
       } else {
         setStatus(llmRun.message + "：导入 " + llmRun.imported + " 项，跳过 " + llmRun.skipped + " 项");
       }
     } catch (error) {
       llmRun.message = "AI (API) 批量视频分类失败：" + error.message;
-      settingsPanelOpen = true;
-      apiSettingsOpen = true;
       setStatus(llmRun.message + "；请先在“设置”中检查并测试 API");
     } finally {
       llmRun.running = false;
@@ -2223,10 +2771,11 @@
   }
 
   async function runLlmBatches(config) {
-    const batchSize = Math.min(100, Math.max(1, Number(config.llmBatchSize) || 50));
+    const batchSize = Math.min(config.classificationProvider === "jev" ? 5 : 100, Math.max(1, Number(config.llmBatchSize) || 50));
     const limit = Math.max(0, Number(config.llmLimit) || 0);
     const includeAll = Boolean(config.llmIncludeAll);
     let offset = 0;
+    const excludedBvids = [];
     while (!llmRun.stopRequested) {
       const remaining = limit ? Math.max(0, limit - llmRun.processed) : batchSize;
       if (limit && remaining <= 0) break;
@@ -2237,10 +2786,11 @@
         type: message.EXPORT_CLASSIFY_BATCH,
         includeAll,
         limit: requested,
-        offset
+        offset,
+        excludedBvids
       });
       if (!exported.batchSize) break;
-      llmRun.total = limit ? Math.min(limit, exported.totalCandidates || 0) : (exported.totalCandidates || 0);
+      llmRun.total = limit ? Math.min(limit, llmRun.processed + (exported.totalCandidates || 0)) : llmRun.processed + (exported.totalCandidates || 0);
       const batch = {
         index: llmRun.batches.length + 1,
         size: exported.batchSize,
@@ -2251,7 +2801,9 @@
       renderEditorOnly();
 
       try {
-        const payload = normalizeLlmPayload(await callLlm(config, exported.prompt || ""));
+        const payload = config.classificationProvider === "jev"
+          ? await core.classifyWithJev(config, exported.batchVideos, exported.categories, fetchWithTimeout)
+          : normalizeLlmPayload(await callLlm(config, exported.prompt || ""));
         batch.llmItems = payload.items.length;
         if (payload.items.length < batch.size) {
           const warning = "第 " + batch.index + " 批 AI 返回 " + payload.items.length + " 项，少于导出 " + batch.size + " 个视频";
@@ -2275,15 +2827,14 @@
         llmRun.imported += batch.imported;
         llmRun.skipped += batch.skipped;
         llmRun.warnings.push(...batch.warnings);
-        if (includeAll) offset += exported.batchSize || 0;
         llmRun.message = "已完成第 " + batch.index + " 批";
       } catch (error) {
         batch.status = "failed";
         batch.error = error.message;
         llmRun.warnings.push("第 " + batch.index + " 批失败：" + error.message);
-        offset += exported.batchSize || 0;
         llmRun.message = "第 " + batch.index + " 批失败，已跳过继续";
       }
+      excludedBvids.push(...exported.batchVideos.map((video) => video.bvid));
       llmRun.processed += exported.batchSize || 0;
       renderEditorOnly();
     }
@@ -2491,8 +3042,8 @@
   async function generateCategoriesWithApi() {
     if (categoryGeneration.running) return;
     const config = Object.assign({}, state.settings || {});
-    if (!apiSettingsReady(config)) {
-      openApiSettings("API 尚未设置完整，请先在“设置”中填写、保存并测试 API");
+    if (!categoryApiSettingsReady(config)) {
+      openApiSettings("生成分类目录需要 OpenAI-compatible API，请先填写并保存地址、模型和密钥");
       return;
     }
     categoryGeneration.running = true;
@@ -2508,8 +3059,6 @@
     } catch (error) {
       categoryGeneration.running = false;
       categoryGeneration.message = "API 生成分类目录失败：" + error.message;
-      settingsPanelOpen = true;
-      apiSettingsOpen = true;
       setStatus(categoryGeneration.message + "；请先在“设置”中检查并测试 API");
       renderEditorOnly();
     }
@@ -2567,6 +3116,7 @@
     const order = siblings.reduce((max, category) => Math.max(max, Number(category.order) || 0), 0) + 10;
     draft.push({ id, name, parentId: parentId || undefined, order, keywords: [], enabled: true });
     categoryDraftDirty = true;
+    newCategoryDraft = { name: "", parent: parentId };
     setStatus("已加入分类草稿：" + name + "；点击“确定保存”后生效");
     renderEditorOnly();
   }
@@ -2647,17 +3197,18 @@
   }
 
   async function removeFromWatchlater(bvid) {
+    if (pendingRemovalBvids.has(bvid)) return;
     const videoIndex = state.videos.findIndex((item) => item.bvid === bvid);
     const video = state.videos[videoIndex];
     if (!video) return;
     const previousVideo = Object.assign({}, video);
+    pendingRemovalBvids.add(bvid);
     video.presentInWatchlater = false;
     selectedBvids.delete(bvid);
     if (selectedBvid === bvid) {
-      const first = visibleVideos()[0] || presentVideos()[0];
-      selectedBvid = first ? first.bvid : "";
+      selectedBvid = "";
     }
-    renderShell();
+    renderShell({ animateCards: true });
     setStatus("已从列表移除，正在向 B站确认：" + core.truncateText(video.title || bvid, 30));
     try {
       const result = await send({
@@ -2665,15 +3216,18 @@
         bvid
       });
       updateState(result);
+      pendingRemovalBvids.delete(bvid);
+      confirmedRemovalBvids.add(bvid);
       setStatus("B站已确认移出：" + core.truncateText(video.title || bvid, 30));
     } catch (error) {
+      pendingRemovalBvids.delete(bvid);
       const current = state.videos.find((item) => item.bvid === bvid);
       if (current) {
         current.presentInWatchlater = true;
       } else {
         state.videos.splice(Math.max(0, videoIndex), 0, previousVideo);
       }
-      renderShell();
+      renderShell({ animateCards: true });
       setStatus("移出失败，视频已恢复：" + error.message);
     }
   }
@@ -2687,6 +3241,7 @@
         bvid,
         categoryIds
       }));
+      closeModal();
       setStatus("已保存手动确认：" + bvid);
       await finishClassificationAndSync("手动确认已保存");
     } catch (error) {
@@ -2719,6 +3274,10 @@
   }
 
   function compareVideos(a, b) {
+    if (randomOrder) {
+      const rankDifference = (randomOrder.get(a.bvid) ?? Number.MAX_SAFE_INTEGER) - (randomOrder.get(b.bvid) ?? Number.MAX_SAFE_INTEGER);
+      return rankDifference || compareWatchlaterOrder(a, b);
+    }
     const mode = state.settings.sortMode || "watchlater";
     const desc = (state.settings.sortDirection || "desc") === "desc";
     if (mode === "pubdate") {
@@ -2739,6 +3298,34 @@
       compareNumber(a.firstSeenAt, b.firstSeenAt, newestFirst) ||
       compareNumber(a.lastSeenAt, b.lastSeenAt, newestFirst) ||
       (a.title || "").localeCompare(b.title || "");
+  }
+
+  function shuffledVideos(videos, random = Math.random) {
+    const shuffled = videos.slice();
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    // A click should visibly change the order when there are at least two videos.
+    if (shuffled.length > 1 && shuffled.every((video, index) => video.bvid === videos[index].bvid)) {
+      [shuffled[0], shuffled[1]] = [shuffled[1], shuffled[0]];
+    }
+    return shuffled;
+  }
+
+  function shuffleVideos() {
+    sortRequest++;
+    const visible = visibleVideos();
+    if (visible.length < 2) {
+      setStatus("至少需要两个视频才能乱序");
+      return;
+    }
+    const shuffled = shuffledVideos(visible);
+    const visibleIds = new Set(visible.map((video) => video.bvid));
+    const remaining = presentVideos().filter((video) => !visibleIds.has(video.bvid)).sort(compareVideos);
+    randomOrder = new Map(shuffled.concat(remaining).map((video, index) => [video.bvid, index]));
+    renderShell({ animateCards: true, reflowDuration: 480 });
+    setStatus("已随机排列 " + visible.length + " 个视频；再次点击“乱序”可重新打乱");
   }
 
   function compareNumber(a, b, desc) {
@@ -2831,9 +3418,12 @@
     });
   }
 
+  function categoryLevelLabel(level) {
+    return ["一级", "二级", "三级", "四级"][level] || (level + 1) + "级";
+  }
+
   function categoryTreeLabel(category, level) {
-    const prefix = level ? "　".repeat(level) + "└ " : "";
-    return prefix + (category.name || category.id);
+    return categoryLevelLabel(level) + " · " + (category.name || category.id);
   }
 
   function categoryBadgeNodes(classification) {
@@ -2850,7 +3440,7 @@
   }
 
   function activeFilterLabel() {
-    let categoryText = "全部";
+    let categoryText = "全部视频";
     if (activeFilter.includeUnclassified) {
       categoryText = "待精细分类";
     } else if (activeFilter.categoryIds.length) {
@@ -2862,7 +3452,7 @@
       categoryText = names.slice(0, 3).join("、") + (names.length > 3 ? " 等" : "");
     }
     const videoText = videoFilterOptionsData().find((item) => item.value === videoFilter);
-    return "筛选：" + categoryText + (videoText && videoText.value ? " · " + videoText.label : "");
+    return categoryText + (videoText && videoText.value ? " · " + videoText.label : "");
   }
 
   function videoFilterOptionsData() {
@@ -2891,25 +3481,155 @@
 
   function setStatus(textValue) {
     statusNotice = { text: textValue || "", kind: statusKind(textValue) };
+    recordOperationLog(statusNotice);
+    noticeExpiresAt = Date.now() + (statusNotice.kind === "error" ? 8000 : 5000);
+    clearTimeout(noticeTimer);
     updateStatusSurface();
+    noticeTimer = setTimeout(() => {
+      noticeExpiresAt = 0;
+      updateStatusSurface();
+    }, statusNotice.kind === "error" ? 8000 : 5000);
+  }
+
+  function readOperationLogs() {
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(OPERATION_LOG_KEY) || "[]");
+      if (!Array.isArray(stored)) throw new Error("Invalid operation log");
+      operationLogError = "";
+      const entries = stored.concat(operationLogs)
+        .filter((entry) => entry && Number.isFinite(entry.time) && typeof entry.text === "string");
+      return Array.from(new Map(entries.map((entry) => [JSON.stringify([entry.time, entry.kind, entry.text]), entry])).values())
+        .sort((a, b) => a.time - b.time).slice(-OPERATION_LOG_LIMIT);
+    } catch {
+      operationLogError = "无法读取本地日志；本次记录仍会显示在这里。";
+      return operationLogs;
+    }
+  }
+
+  function redactLogText(value) {
+    let textValue = String(value || "");
+    const configs = [state.settings, apiSettingsDraft];
+    configs.forEach((config) => {
+      [config && config.llmApiKey, config && config.jevApiKey].filter(Boolean).forEach((secret) => {
+        textValue = textValue.split(secret).join("[已隐藏密钥]");
+      });
+    });
+    return textValue.replace(/Bearer\s+[^\s,;"']+/gi, "Bearer [已隐藏密钥]")
+      .replace(/sk-[a-zA-Z0-9_-]+/g, "[已隐藏密钥]").slice(0, 1000);
+  }
+
+  function recordOperationLog(notice) {
+    if (!notice.text) return;
+    const textValue = redactLogText(notice.text);
+    // Re-read before appending so another open dashboard's recent entries survive.
+    operationLogs = readOperationLogs();
+    const previous = operationLogs[operationLogs.length - 1];
+    if (previous && previous.text === textValue && previous.kind === notice.kind) return;
+    operationLogs = operationLogs.concat({ time: Date.now(), kind: notice.kind, text: textValue })
+      .slice(-OPERATION_LOG_LIMIT);
+    try {
+      window.localStorage.setItem(OPERATION_LOG_KEY, JSON.stringify(operationLogs));
+      operationLogError = "";
+    } catch {
+      operationLogError = "日志保存失败，本次记录仅在当前页面保留。";
+    }
+    updateOperationLogSurface();
+  }
+
+  function renderOperationLogSection() {
+    return el("section", { className: "settings-subfold", dataset: { fold: "operation-log" } }, [
+      el("div", { className: "settings-subbody" }, [
+        el("p", { className: "sub", textContent: "自动保存在本机，保留最近 200 条操作反馈，最新记录在上方。" }),
+        el("p", { className: "operation-log-error", dataset: { role: "operation-log-error" }, textContent: operationLogError }),
+        renderOperationLogList()
+      ])
+    ]);
+  }
+
+  function renderOperationLogList() {
+    const labels = { info: "提示", running: "进行中", success: "完成", error: "失败" };
+    return el("ol", { className: "operation-log-list", dataset: { role: "operation-log-list" }, "aria-label": "操作日志" },
+      operationLogs.length ? operationLogs.slice().reverse().map((entry) => el("li", {
+        className: "operation-log-entry log-" + (Object.hasOwn(labels, entry.kind) ? entry.kind : "info")
+      }, [
+        el("div", { className: "operation-log-meta" }, [
+          el("span", { textContent: labels[entry.kind] || labels.info }),
+          el("time", { textContent: new Date(entry.time).toLocaleString("zh-CN", { hour12: false }) })
+        ]),
+        el("p", { textContent: entry.text })
+      ])) : [el("li", { className: "sub", textContent: "暂无操作记录" })]);
+  }
+
+  function updateOperationLogSurface() {
+    const list = document.querySelector('[data-role="operation-log-list"]');
+    if (list) {
+      const scrollTop = list.scrollTop;
+      const next = renderOperationLogList();
+      list.replaceWith(next);
+      next.scrollTop = scrollTop;
+    }
+    const error = document.querySelector('[data-role="operation-log-error"]');
+    if (error) error.textContent = operationLogError;
+  }
+
+  function positionStatusNotice() {
+    const topbar = document.querySelector(".topbar");
+    const surface = document.querySelector('[data-role="status-surface"]');
+    if (topbar && surface?.style) {
+      const top = Math.max(16, topbar.getBoundingClientRect().bottom + 12);
+      surface.style.setProperty("--notice-top", top + "px");
+    }
+  }
+
+  function observeStatusPosition() {
+    noticeLayoutObserver?.disconnect();
+    const topbar = document.querySelector(".topbar");
+    if (topbar) {
+      noticeLayoutObserver = new ResizeObserver(positionStatusNotice);
+      noticeLayoutObserver.observe(topbar);
+    }
+    positionStatusNotice();
   }
 
   function updateStatusSurface() {
+    positionStatusNotice();
     const textValue = statusText();
     const kind = statusNotice.text ? statusNotice.kind : statusKind(textValue);
     const surface = document.querySelector('[data-role="status-surface"]');
     const node = document.querySelector('[data-role="status"]');
     const icon = document.querySelector('[data-role="status-icon"]');
     if (node) node.textContent = textValue;
-    if (surface) surface.className = "activity-status status-" + kind;
+    if (surface) {
+      surface.hidden = Date.now() >= noticeExpiresAt;
+      if (surface.hidden) surface.hidePopover?.();
+      else if (!surface.matches?.(":popover-open")) surface.showPopover?.();
+      const className = "activity-status feedback-notice status-" + kind;
+      if (surface.className !== className) {
+        surface.className = className;
+        globalThis.BiliWLAura?.refresh();
+      }
+    }
     if (icon) icon.replaceChildren(statusIcon(kind));
+  }
+
+  function renderFeedbackAura(seed) {
+    const aura = renderCategoryAura("large", seed);
+    aura.className += " feedback-aura";
+    return aura;
+  }
+
+  function renderFeedbackNotice(className, message) {
+    return el("div", { className: className + " feedback-notice status-" + statusKind(message), role: "status" }, [
+      renderFeedbackAura(className),
+      el("span", { className: "feedback-notice-copy", textContent: message })
+    ]);
   }
 
   function statusKind(textValue) {
     const value = String(textValue || "");
     if (/失败|错误|无法|缺少|未登录|不可用|超时/.test(value)) return "error";
     if (/正在|排队|请等待|启动中|处理中|更新中/.test(value)) return "running";
-    if (/完成|成功|已同步|已保存|已移出|已生成|已复制|已导入|没有缺失/.test(value)) return "success";
+    if (/完成|成功|已同步|已保存|已移出|已确认移出|已生成|已复制|已导入|没有缺失/.test(value)) return "success";
     return "info";
   }
 
@@ -3021,6 +3741,7 @@
   function sortOptions() {
     const current = sortComboValue();
     return [
+      ...(randomOrder ? [option("random", "随机排序", current)] : []),
       option("watchlater:desc", "添加时间-降序", current),
       option("watchlater:asc", "添加时间-升序", current),
       option("pubdate:desc", "发布时间-降序", current),
@@ -3031,6 +3752,7 @@
   }
 
   function sortComboValue() {
+    if (randomOrder) return "random";
     const mode = ["watchlater", "pubdate", "duration"].includes(state.settings.sortMode) ? state.settings.sortMode : "watchlater";
     const direction = state.settings.sortDirection === "asc" ? "asc" : "desc";
     return mode + ":" + direction;
@@ -3051,7 +3773,7 @@
     const descendants = new Set(core.descendantsOf(category.id, categories));
     const options = [el("option", {
       value: "",
-      textContent: "一级分类",
+      textContent: "无上级（一级分类）",
       selected: !category.parentId
     })].concat(flattenCategoriesInTree(categories)
       .filter((row) => row.category.id !== category.id && !descendants.has(row.category.id))
@@ -3061,17 +3783,19 @@
         selected: (category.parentId || "") === row.category.id
       })));
     return el("div", {
-      className: "category-admin-row",
-      style: "--admin-indent:" + (Math.min(level || 0, 4) * 12) + "px;"
+      className: "category-admin-row" + (level === 0 ? " category-admin-root" : ""),
+      style: "--admin-indent:" + (Math.min(level || 0, 4) * 14) + "px;"
     }, [
-      el("span", { className: "swatch", style: categoryStyle(category, "swatch") }),
-      el("div", { className: "category-admin-fields" }, [
-        el("input", { type: "text", value: category.name, dataset: { role: "category-name", categoryId: category.id } }),
-        el("select", { dataset: { role: "category-parent", categoryId: category.id } }, options)
+      el("span", { className: "category-depth level-badge level-" + (level + 1), title: "第 " + (level + 1) + " 级分类", textContent: categoryLevelLabel(level) }),
+      el("div", { className: "category-admin-name" }, [
+        el("input", { type: "text", value: category.name, "aria-label": "分类名称：" + category.name, dataset: { role: "category-name", categoryId: category.id } })
       ]),
-      el("div", { className: "category-admin-actions" }, [
-        el("button", { className: "danger", dataset: { action: "delete-category", categoryId: category.id }, textContent: "删除" })
-      ])
+      el("select", { "aria-label": "上级分类：" + category.name, dataset: { role: "category-parent", categoryId: category.id } }, options),
+      el("button", {
+        className: "category-delete-button", title: "从草稿删除“" + category.name + "”及其子分类",
+        "aria-label": "删除分类“" + category.name + "”",
+        dataset: { action: "delete-category", categoryId: category.id }
+      }, [iconNode("trash")])
     ]);
   }
 
@@ -3106,23 +3830,23 @@
   }
 
   function categoryStyle(category, kind) {
-    const color = categoryColor(category);
-    if (kind === "swatch") return "background:" + color.accent + ";";
-    if (kind === "row") return "--cat-bg:" + color.bg + ";--cat-border:" + color.border + ";--cat-text:" + color.text + ";--cat-accent:" + color.accent + ";";
-    if (kind === "badge") return "background:" + color.bg + ";border-color:" + color.border + ";color:" + color.text + ";";
-    if (kind === "option") return "background:" + color.bg + ";color:" + color.text + ";";
+    if (kind === "swatch") return "background:" + core.categoryColorTokens(state.categories, category).accent + ";";
+    if (kind === "badge") {
+      const tone = core.categoryColorTokens(state.categories, category);
+      return "background:" + tone.bg + ";border-color:transparent;color:" + tone.text + ";";
+    }
+    if (kind === "option") return "background:var(--surface);color:var(--ink);";
     return "";
-  }
-
-  function categoryColor(category) {
-    return core.categoryColorTokens(state.categories, category);
   }
 
   function rememberScrollPositions() {
     const categoryNav = document.querySelector(".cat-nav");
     const main = document.querySelector(".main");
     const editor = document.querySelector(".editor");
-    if (categoryNav) savedCategoryScrollTop = categoryNav.scrollTop;
+    if (categoryNav) {
+      const height = Number(categoryNav.dataset.cycleHeight);
+      savedCategoryScrollTop = height ? categoryLoopOffset(categoryNav.scrollTop, height) : categoryNav.scrollTop;
+    }
     if (main) savedMainScrollTop = main.scrollTop;
     if (editor) savedEditorScrollTop = editor.scrollTop;
   }
@@ -3131,14 +3855,14 @@
     const categoryNav = document.querySelector(".cat-nav");
     const main = document.querySelector(".main");
     const editor = document.querySelector(".editor");
-    if (categoryNav) categoryNav.scrollTop = savedCategoryScrollTop;
+    if (categoryNav) setupCategoryLoop(categoryNav);
     if (main) main.scrollTop = savedMainScrollTop;
     if (editor) editor.scrollTop = savedEditorScrollTop;
   }
 
   function toolbarIconButton(action, label, iconName) {
     return el("button", {
-      className: "ghost toolbar-icon-button",
+      className: "toolbar-icon-button liquid-glass liquid-glass--simple glass-control",
       title: label,
       "aria-label": label,
       dataset: { action }
@@ -3152,6 +3876,9 @@
   function iconNode(name) {
     const svg = svgNode("svg", {
       viewBox: "0 0 24 24",
+      class: "ui-icon",
+      width: "24", height: "24", fill: "none", stroke: "currentColor",
+      "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round",
       "aria-hidden": "true",
       focusable: "false"
     });
@@ -3162,7 +3889,22 @@
       "stroke-linecap": "round",
       "stroke-linejoin": "round"
     };
+    // Lucide SVG subset, pinned at a04f228cd01185e09c188b7227b9600c08c565ec. License: icons/lucide/LICENSE.
     const shapes = {
+      "search": [["path",{"d":"m21 21-4.34-4.34"}],["circle",{"cx":"11","cy":"11","r":"8"}]],
+      "sync": [["path",{"d":"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"}],["path",{"d":"M21 3v5h-5"}],["path",{"d":"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"}],["path",{"d":"M8 16H3v5"}]],
+      "batch": [["path",{"d":"M13 5h8"}],["path",{"d":"M13 12h8"}],["path",{"d":"M13 19h8"}],["path",{"d":"m3 17 2 2 4-4"}],["path",{"d":"m3 7 2 2 4-4"}]],
+      "settings": [["path",{"d":"M14 17H5"}],["path",{"d":"M19 7h-9"}],["circle",{"cx":"17","cy":"17","r":"3"}],["circle",{"cx":"7","cy":"7","r":"3"}]],
+      "shuffle": [["path",{"d":"m18 14 4 4-4 4"}],["path",{"d":"m18 2 4 4-4 4"}],["path",{"d":"M2 18h1.973a4 4 0 0 0 3.3-1.7l5.454-8.6a4 4 0 0 1 3.3-1.7H22"}],["path",{"d":"M2 6h1.972a4 4 0 0 1 3.6 2.2"}],["path",{"d":"M22 18h-6.041a4 4 0 0 1-3.3-1.8l-.359-.45"}]],
+      "trash": [["path",{"d":"M10 11v6"}],["path",{"d":"M14 11v6"}],["path",{"d":"M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"}],["path",{"d":"M3 6h18"}],["path",{"d":"M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"}]],
+      "play": [["path",{"d":"M21 5H3"}],["path",{"d":"M10 12H3"}],["path",{"d":"M10 19H3"}],["path",{"d":"M15 12.003a1 1 0 0 1 1.517-.859l4.997 2.997a1 1 0 0 1 0 1.718l-4.997 2.997a1 1 0 0 1-1.517-.86z"}]],
+      "spinner": [["path",{"d":"M21 12a9 9 0 1 1-6.219-8.56"}]],
+      "success": [["circle",{"cx":"12","cy":"12","r":"10"}],["path",{"d":"m16 9-5.5 5.5L8 12"}]],
+      "error": [["circle",{"cx":"12","cy":"12","r":"10"}],["line",{"x1":"12","x2":"12","y1":"8","y2":"12"}],["line",{"x1":"12","x2":"12.01","y1":"16","y2":"16"}]],
+      "info": [["circle",{"cx":"12","cy":"12","r":"10"}],["path",{"d":"M12 16v-4"}],["path",{"d":"M12 8h.01"}]],
+      "check": [["path",{"d":"M20 6 9 17l-5-5"}]],
+      "close": [["path",{"d":"M18 6 6 18"}],["path",{"d":"m6 6 12 12"}]],
+      "chevron": [["path",{"d":"m6 9 6 6 6-6"}]],
       bilibili: [
         ["path", Object.assign({ d: "M8.2 4 10 6.2h4L15.8 4M5.2 7.1h13.6a2 2 0 0 1 2 2v8.2a2 2 0 0 1-2 2H5.2a2 2 0 0 1-2-2V9.1a2 2 0 0 1 2-2Z" }, commonStroke)],
         ["path", Object.assign({ d: "M8 12v2.2M16 12v2.2" }, commonStroke)]
@@ -3176,29 +3918,6 @@
         ["path", Object.assign({ d: "M12 3.5a8.5 8.5 0 0 1 8.5 8.5M3.5 12A8.5 8.5 0 0 1 12 3.5M12 20.5A8.5 8.5 0 0 1 3.5 12" }, commonStroke)],
         ["circle", { cx: "20.5", cy: "12", r: "1.3", fill: "currentColor" }]
       ],
-      trash: [
-        ["path", Object.assign({ d: "M5.5 7h13M9.3 7V4.8h5.4V7M7.5 7l.8 12h7.4l.8-12M10.2 10.2v5.6M13.8 10.2v5.6" }, commonStroke)]
-      ],
-      play: [
-        ["rect", Object.assign({ x: "3.5", y: "5.5", width: "17", height: "13", rx: "3" }, commonStroke)],
-        ["path", { d: "m10 9 5 3-5 3Z", fill: "currentColor" }]
-      ],
-      spinner: [
-        ["circle", Object.assign({ cx: "12", cy: "12", r: "8.2", opacity: ".25" }, commonStroke)],
-        ["path", Object.assign({ d: "M12 3.8a8.2 8.2 0 0 1 8.2 8.2" }, commonStroke)]
-      ],
-      success: [
-        ["circle", Object.assign({ cx: "12", cy: "12", r: "8.5" }, commonStroke)],
-        ["path", Object.assign({ d: "m8.2 12.1 2.5 2.5 5.3-5.4" }, commonStroke)]
-      ],
-      error: [
-        ["circle", Object.assign({ cx: "12", cy: "12", r: "8.5" }, commonStroke)],
-        ["path", Object.assign({ d: "M12 7.5v5.8M12 16.6h.01" }, commonStroke)]
-      ],
-      info: [
-        ["circle", Object.assign({ cx: "12", cy: "12", r: "8.5" }, commonStroke)],
-        ["path", Object.assign({ d: "M12 10.6v6M12 7.4h.01" }, commonStroke)]
-      ]
     };
     (shapes[name] || shapes.info).forEach(([tagName, attrs]) => svg.appendChild(svgNode(tagName, attrs)));
     return svg;
@@ -3258,7 +3977,9 @@
       if (key === "className") node.className = value;
       else if (key === "textContent") node.textContent = value;
       else if (key === "dataset") Object.entries(value || {}).forEach(([dataKey, dataValue]) => { node.dataset[dataKey] = dataValue; });
+      else if (key === "hidden") node.hidden = Boolean(value);
       else if (key === "checked") node.checked = Boolean(value);
+      else if (key === "disabled") node.disabled = Boolean(value);
       else if (key === "selected") node.selected = Boolean(value);
       else if (key === "value") node.value = value;
       else if (key === "placeholder") node.placeholder = value;

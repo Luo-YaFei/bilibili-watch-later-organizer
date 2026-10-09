@@ -13,6 +13,68 @@ function loadCore() {
 
 const core = loadCore();
 
+test("stored legacy fallback name is corrected without changing custom categories or video assignments", async () => {
+  const bg = loadBackgroundHelpers();
+  const categories = [
+    { id: "other.todo", name: "待整理", parentId: "other", enabled: false, keywords: ["保留"] },
+    { id: "custom.todo", name: "待整理", enabled: true }
+  ];
+  const updates = [];
+  bg.chromeStorageGet = async () => ({ settings: {}, categories });
+  bg.chromeStorageSet = async (value) => updates.push(value);
+  await bg.ensureConfig();
+  assert.equal(updates[0].categories[0].name, "暂未归类");
+  assert.equal(updates[0].categories[0].enabled, false);
+  assert.equal(updates[0].categories[0].keywords[0], "保留");
+  assert.equal(updates[0].categories[1].name, "待整理");
+  assert.equal(updates[0].classifications, undefined);
+  categories[0].name = "我稍后决定";
+  await bg.ensureConfig();
+  assert.equal(updates[1].categories, undefined);
+  const imported = bg.normalizeImportedCategories([
+    { id: "other", name: "其他" }, { id: "other.todo", name: "待整理", parentId: "other" }
+  ], { allowSmall: true });
+  assert.equal(imported.find((item) => item.id === "other.todo").name, "暂未归类");
+});
+
+test("content category and pending classification are independent filters", () => {
+  const video = { bvid: "BV1xx411c7mD", presentInWatchlater: true };
+  const initial = core.mergeClassification(null, { bvid: video.bvid, categoryIds: ["tech"], sourceType: "keyword", confidence: 0.8 }, video);
+  assert.equal(core.needsLlmExport(video, initial), true);
+  assert.equal(core.matchesFilter(video, initial, { categoryIds: ["other.todo"] }), false);
+  const manual = core.mergeClassification(null, { bvid: video.bvid, categoryIds: ["other.todo"], sourceType: "manual", confidence: 1 }, video);
+  assert.equal(core.needsLlmExport(video, manual), false);
+  assert.equal(core.matchesFilter(video, manual, { categoryIds: ["other.todo"] }), true);
+});
+
+test("Jev automatic continuation skips uncertain videos already attempted in this round", async () => {
+  const bg = loadBackgroundHelpers();
+  const video = { bvid: "BV1xx411c7mD", title: "数学课程", presentInWatchlater: true };
+  const categories = [{ id: "study", name: "学习" }];
+  const settings = { classificationProvider: "jev", jevApiKey: "test", jevModel: "jev-latest", llmBatchSize: 50 };
+  const stored = {};
+  let calls = 0;
+  const classifications = [];
+  bg.getConfig = async () => ({ settings, categories });
+  bg.BiliWLDB.summary = async () => ({ videos: [video], classifications });
+  bg.chromeStorageGet = async () => stored;
+  bg.chromeStorageSet = async (value) => Object.assign(stored, value);
+  bg.fetchWithTimeout = async () => {
+    calls++;
+    return { ok: true, status: 200, json: async () => ({ answers: { video_0: { type: "choice", choice: "study", confidence: 0.3 } } }) };
+  };
+  bg.importClassifications = async (payload) => {
+    classifications.push(core.mergeClassification(null, JSON.parse(payload).items[0], video));
+    return { importResult: { imported: 1, skipped: 0 } };
+  };
+  const result = await bg.runAutomaticLlmBatches(settings, false);
+  assert.equal(calls, 1);
+  assert.equal(result.remaining, 0);
+  assert.equal(core.needsLlmExport(video, classifications[0]), true);
+  await bg.runAutomaticLlmBatches(settings, true);
+  assert.equal(calls, 1);
+});
+
 function loadBackgroundHelpers() {
   const source = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   const sandbox = {
@@ -43,12 +105,365 @@ function loadBackgroundHelpers() {
   return sandbox;
 }
 
+test("bulk multi-category add preserves existing manual assignments and rejects invalid selections before writing", async () => {
+  const bg = loadBackgroundHelpers();
+  const videos = [{ bvid: "BV1xx411c7mD" }, { bvid: "BV1yy411c7mE" }];
+  const saved = new Map(videos.map(video => [video.bvid, {
+    bvid: video.bvid, categoryIds: ["original"], sourceType: "manual", manualOverride: true
+  }]));
+  let writes = 0;
+  bg.getConfig = async () => ({ categories: ["original", "study", "music"].map(id => ({ id })) });
+  bg.getState = async () => ({});
+  bg.BiliWLDB.getAll = async () => videos;
+  bg.BiliWLDB.getClassification = async bvid => saved.get(bvid);
+  bg.BiliWLDB.putClassification = async item => { writes++; saved.set(item.bvid, item); };
+  const result = await bg.bulkUpdateClassifications({ action: "add", bvids: videos.map(video => video.bvid), categoryIds: ["study", "music", "study"] });
+  assert.equal(result.bulkUpdateResult.updated, 2);
+  for (const item of saved.values()) {
+    assert.deepEqual(Array.from(item.categoryIds), ["original", "study", "music"]);
+    assert.equal(item.sourceType, "manual");
+    assert.equal(item.manualOverride, true);
+  }
+  for (const categoryIds of [[], ["study", "missing"]]) {
+    await assert.rejects(bg.bulkUpdateClassifications({ action: "add", bvids: [videos[0].bvid], categoryIds }), /请选择有效分类/);
+  }
+  assert.equal(writes, 2);
+  await bg.bulkUpdateClassifications({ action: "clear", bvids: [videos[0].bvid] });
+  assert.deepEqual(Array.from(saved.get(videos[0].bvid).categoryIds), []);
+});
+
+test("delete prefers a live Bilibili page without sending a background POST", async () => {
+  const bg = loadBackgroundHelpers();
+  const calls = [];
+  bg.getBiliCsrf = async () => "token";
+  bg.chrome.tabs.query = async () => [{ id: 3, status: "complete" }];
+  bg.requestWatchlaterRemoveFromPage = async (aid, csrf, bvid, tab) => calls.push([aid, csrf, bvid, tab.id]);
+  bg.performWatchlaterRemoval = async () => assert.fail("unnecessary background request");
+  await bg.requestWatchlaterRemove(123, "BV123");
+  assert.deepEqual(calls, [[123, "token", "BV123", 3]]);
+});
+
+test("delete falls back after a page closes and works without any Bilibili tab", async () => {
+  for (const tabs of [[], [{ id: 3, status: "complete" }]]) {
+    const bg = loadBackgroundHelpers();
+    let posts = 0;
+    bg.getBiliCsrf = async () => "token";
+    bg.chrome.tabs.query = async () => tabs;
+    bg.requestWatchlaterRemoveFromPage = async () => { throw new Error("No tab with id: 3"); };
+    bg.performWatchlaterRemoval = async () => { posts++; return { verified: true }; };
+    await bg.requestWatchlaterRemove(123, "BV123");
+    assert.equal(posts, 1);
+  }
+});
+
+test("delete ignores discarded and frozen tabs even if they are active", async () => {
+  const bg = loadBackgroundHelpers();
+  bg.chrome.tabs.query = async () => [
+    { id: 1, active: true, status: "complete", discarded: true },
+    { id: 2, active: true, status: "complete", frozen: true },
+    { id: 3, status: "complete" }
+  ];
+  assert.equal((await bg.findBilibiliTab()).id, 3);
+  bg.chrome.tabs.query = async () => [{ id: 1, discarded: true }];
+  assert.equal(await bg.findBilibiliTab(), null);
+});
+
+function preparePageDelete(bg) {
+  Object.assign(bg, { setTimeout: (fn, ms) => setTimeout(fn, ms < 2000 ? 0 : ms), clearTimeout, FormData, AbortController });
+  bg.chrome.scripting = {
+    executeScript: async ({ func, args }) => [{ result: await func(...args) }]
+  };
+}
+
+test("unloaded tabs are excluded even when discarded and frozen are false", async () => {
+  const bg = loadBackgroundHelpers();
+  const unloaded = [8531, 8543, 8586].map((id) => ({
+    id, status: "unloaded", active: false, discarded: false, frozen: false
+  }));
+  bg.chrome.tabs.query = async () => unloaded;
+  assert.equal(await bg.findBilibiliTab(), null);
+  bg.chrome.tabs.query = async () => [...unloaded, { id: 9, status: "loading" }];
+  assert.equal((await bg.findBilibiliTab()).id, 9);
+  bg.chrome.tabs.query = async () => [...unloaded, { id: 10, status: "complete" }];
+  assert.equal((await bg.findBilibiliTab()).id, 10);
+});
+
+test("delete automatically loads an existing unloaded tab without activating or creating tabs", async () => {
+  const bg = loadBackgroundHelpers();
+  Object.assign(bg, { setTimeout: (fn, ms) => setTimeout(fn, ms === 250 ? 0 : ms), clearTimeout });
+  bg.getBiliCsrf = async () => "token";
+  const tab = { id: 1, url: "https://www.bilibili.com/video/BV1Yz411B7n3/", status: "unloaded", discarded: false, frozen: false };
+  let reloads = 0, probes = 0, deletes = 0;
+  bg.chrome.tabs.query = async () => [tab];
+  bg.chrome.tabs.get = async () => ({ ...tab });
+  bg.chrome.tabs.reload = async (id) => { assert.equal(id, 1); reloads++; tab.status = "loading"; tab.pendingUrl = tab.url; };
+  bg.chrome.tabs.update = bg.chrome.tabs.create = async () => assert.fail("must preserve current tab and focus");
+  bg.chrome.scripting = { executeScript: async (options) => {
+    assert.equal(options.injectImmediately, true);
+    probes++;
+    if (probes === 1) throw new Error("Cannot access contents of the page");
+    return [{ result: true }];
+  } };
+  bg.requestWatchlaterRemoveFromPage = async () => { deletes++; return { verified: true }; };
+  bg.performWatchlaterRemoval = async () => assert.fail("page is ready; no background fallback needed");
+  assert.equal((await bg.requestWatchlaterRemove(123, "BV1Yz411B7n3")).verified, true);
+  assert.equal(reloads, 1);
+  assert.equal(probes, 2);
+  assert.equal(deletes, 1);
+});
+
+test("a tab activated by the user during preparation is not reloaded", async () => {
+  const bg = loadBackgroundHelpers();
+  Object.assign(bg, { setTimeout, clearTimeout });
+  bg.chrome.tabs.query = async () => [{ id: 1, status: "unloaded" }];
+  bg.chrome.tabs.get = async () => ({ id: 1, status: "complete", url: "https://www.bilibili.com/" });
+  bg.chrome.tabs.reload = async () => assert.fail("must not reload a loaded page");
+  bg.chrome.scripting = { executeScript: async () => [{ result: true }] };
+  assert.equal((await bg.loadExistingBilibiliTab()).id, 1);
+});
+
+test("background loading stops if the tab closes or navigates elsewhere", async () => {
+  for (const destination of [null, "https://example.com/"]) {
+    const bg = loadBackgroundHelpers();
+    Object.assign(bg, { setTimeout, clearTimeout });
+    let reloaded = false;
+    bg.chrome.tabs.query = async () => [{ id: 1, status: "unloaded" }];
+    bg.chrome.tabs.reload = async () => { reloaded = true; };
+    bg.chrome.tabs.get = async () => {
+      if (reloaded && destination === null) throw new Error("No tab with id: 1");
+      return { id: 1, status: "unloaded", url: reloaded ? destination : "https://www.bilibili.com/" };
+    };
+    bg.chrome.scripting = { executeScript: async () => assert.fail("must not inject") };
+    await assert.rejects(bg.loadExistingBilibiliTab(), /No tab|正在跳转/);
+  }
+});
+
+test("background page preparation has a deadline even if the readiness probe hangs", async () => {
+  const bg = loadBackgroundHelpers();
+  Object.assign(bg, { setTimeout: (fn) => setTimeout(fn, 5), clearTimeout });
+  bg.chrome.tabs.query = async () => [{ id: 1, status: "unloaded" }];
+  let reloaded = false;
+  bg.chrome.tabs.get = async () => ({ id: 1, status: reloaded ? "loading" : "unloaded", url: "https://www.bilibili.com/" });
+  bg.chrome.tabs.reload = async () => { reloaded = true; };
+  bg.chrome.scripting = { executeScript: () => new Promise(() => {}) };
+  await assert.rejects(bg.loadExistingBilibiliTab(), /后台加载 B站页面超时/);
+});
+
+test("no existing page does not create a temporary tab", async () => {
+  const bg = loadBackgroundHelpers();
+  bg.chrome.tabs.query = async () => [];
+  bg.chrome.tabs.create = async () => assert.fail("must not create temporary tabs");
+  assert.equal(await bg.loadExistingBilibiliTab(), null);
+});
+
+test("delete injects immediately into a loading page without waiting for tab completion", async () => {
+  const bg = loadBackgroundHelpers();
+  Object.assign(bg, { setTimeout, clearTimeout });
+  bg.chrome.tabs.get = async () => { throw new Error("must not wait for tab completion"); };
+  bg.chrome.tabs.onUpdated = { addListener() {}, removeListener() {} };
+  bg.chrome.scripting = {
+    executeScript: async (options) => {
+      assert.equal(options.injectImmediately, true);
+      assert.equal(options.world, "MAIN");
+      assert.equal(options.target.tabId, 3);
+      return [{ result: { verified: true, bvid: "BV1Yz411B7n3" } }];
+    }
+  };
+  const result = await bg.requestWatchlaterRemoveFromPage(123, "token", "BV1Yz411B7n3", { id: 3, status: "loading" });
+  assert.equal(result.verified, true);
+});
+
+const deleteTarget = { aid: 123, bvid: "BV1Yz411B7n3" };
+const listResponse = (items) => ({ ok: true, json: async () => ({ code: 0, data: { count: items.length, list: items } }) });
+const apiSuccess = () => ({ ok: true, json: async () => ({ code: 0 }) });
+const deleteRequest = () => ({ ...deleteTarget, csrf: "token", deadline: Date.now() + 20000 });
+
+test("injected delete uses current official resources API and preserves business errors", async () => {
+  const bg = loadBackgroundHelpers();
+  preparePageDelete(bg);
+  bg.fetch = async (url, options) => {
+    if (!options.method) return listResponse([deleteTarget]);
+    assert.equal(url, "https://api.bilibili.com/x/v2/history/toview/v2/dels");
+    assert.deepEqual(Array.from(options.body.entries()), [["resources", "123"], ["csrf", "token"]]);
+    assert.equal(options.credentials, "include");
+    assert.ok(options.signal);
+    return { ok: true, json: async () => ({ code: -111, message: "csrf校验失败" }) };
+  };
+  await assert.rejects(bg.requestWatchlaterRemoveFromPage(123, "token", deleteTarget.bvid, { id: 3 }), /登录凭据已变化.*code -111/);
+});
+
+test("an unresponsive injected page releases the deletion queue after timeout", async () => {
+  const bg = loadBackgroundHelpers();
+  preparePageDelete(bg);
+  bg.setTimeout = (fn) => setTimeout(fn, 5);
+  bg.chrome.scripting.executeScript = () => new Promise(() => {});
+  const failed = bg.runWatchlaterMembershipTask(() => bg.requestWatchlaterRemoveFromPage(123, "token", "BV123", { id: 3 }));
+  const next = bg.runWatchlaterMembershipTask(async () => "next deletion ran");
+  await assert.rejects(failed, /页面无响应/);
+  assert.equal(await next, "next deletion ran");
+});
+
+test("delete retains both failure reasons and never reports success", async () => {
+  const bg = loadBackgroundHelpers();
+  bg.getBiliCsrf = async () => "token";
+  bg.chrome.tabs.query = async () => [{ id: 3 }];
+  bg.requestWatchlaterRemoveFromPage = async () => { throw new Error("页面 HTTP 412"); };
+  bg.performWatchlaterRemoval = async () => ({ error: "后台 HTTP 403", retryable: true });
+  await assert.rejects(bg.requestWatchlaterRemove(123, "BV123"), /页面 HTTP 412.*后台 HTTP 403/);
+});
+
+test("code zero with the video still on the server is not a successful deletion", async () => {
+  const bg = loadBackgroundHelpers();
+  preparePageDelete(bg);
+  let posts = 0;
+  bg.fetch = async (url, options) => {
+    if (options.method === "POST") { posts++; return apiSuccess(); }
+    return listResponse([deleteTarget]);
+  };
+  const result = await bg.performWatchlaterRemoval(deleteRequest());
+  assert.equal(result.verified, undefined);
+  assert.match(result.error, /接口返回成功，但视频仍在 B站列表中/);
+  assert.equal(result.retryable, false);
+  assert.equal(posts, 1);
+});
+
+test("delete resolves stale or missing aid from the server and verifies disappearance", async () => {
+  for (const cachedAid of [999, undefined]) {
+    const bg = loadBackgroundHelpers();
+    preparePageDelete(bg);
+    bg.document = { cookie: "other=x; bili_jct=fresh-token" };
+    let removed = false;
+    bg.fetch = async (url, options) => {
+      assert.equal(options.cache, "no-store");
+      if (options.method === "POST") {
+        assert.equal(options.body.get("resources"), "123");
+        assert.equal(options.body.get("csrf"), "fresh-token");
+        removed = true;
+        return apiSuccess();
+      }
+      return listResponse(removed ? [] : [deleteTarget]);
+    };
+    const result = await bg.performWatchlaterRemoval({ ...deleteRequest(), aid: cachedAid });
+    assert.equal(result.verified, true);
+    assert.equal(result.aid, 123);
+  }
+});
+
+test("deletion tolerates delayed list updates without resubmitting POST", async () => {
+  const bg = loadBackgroundHelpers();
+  preparePageDelete(bg);
+  let reads = 0, posts = 0;
+  bg.fetch = async (url, options) => {
+    if (options.method === "POST") { posts++; return apiSuccess(); }
+    return listResponse(++reads < 3 ? [deleteTarget] : []);
+  };
+  assert.equal((await bg.performWatchlaterRemoval(deleteRequest())).verified, true);
+  assert.equal(posts, 1);
+  assert.equal(reads, 3);
+});
+
+test("a lost POST response is verified through the server list", async () => {
+  const bg = loadBackgroundHelpers();
+  preparePageDelete(bg);
+  let removed = false;
+  bg.fetch = async (url, options) => {
+    if (options.method === "POST") { removed = true; throw new TypeError("Failed to fetch"); }
+    return listResponse(removed ? [] : [deleteTarget]);
+  };
+  assert.equal((await bg.performWatchlaterRemoval(deleteRequest())).verified, true);
+});
+
+test("incomplete malformed or logged-out lists cannot confirm removal", async () => {
+  for (const json of [
+    { code: 0 }, { code: 0, data: {} },
+    { code: 0, data: { list: [], count: 20 } },
+    { code: 0, data: { list: [null], count: 1 } },
+    { code: -101, message: "未登录" }
+  ]) {
+    const bg = loadBackgroundHelpers();
+    preparePageDelete(bg);
+    bg.fetch = async (url, options) => {
+      assert.notEqual(options.method, "POST");
+      return { ok: true, json: async () => json };
+    };
+    const result = await bg.performWatchlaterRemoval(deleteRequest());
+    assert.equal(result.verified, undefined);
+    assert.equal(result.retryable, false);
+  }
+});
+
+test("already absent videos require no delete POST", async () => {
+  const bg = loadBackgroundHelpers();
+  preparePageDelete(bg);
+  bg.fetch = async (url, options) => {
+    assert.notEqual(options.method, "POST");
+    return listResponse([]);
+  };
+  assert.equal((await bg.performWatchlaterRemoval(deleteRequest())).alreadyAbsent, true);
+});
+
+test("a cached aid belonging to a different video is never deleted", async () => {
+  const bg = loadBackgroundHelpers();
+  preparePageDelete(bg);
+  bg.fetch = async (url, options) => {
+    assert.notEqual(options.method, "POST");
+    return listResponse([{ aid: 123, bvid: "BV1LQ4y1T7Xh" }]);
+  };
+  assert.match((await bg.performWatchlaterRemoval(deleteRequest())).error, /编号与 B站列表不一致/);
+});
+
+test("expired page execution cannot issue a late delete", async () => {
+  const bg = loadBackgroundHelpers();
+  preparePageDelete(bg);
+  bg.fetch = async () => assert.fail("expired request must not fetch");
+  assert.match((await bg.performWatchlaterRemoval({ ...deleteRequest(), deadline: Date.now() - 1 })).error, /超时/);
+});
+
+test("failed server verification never marks local membership removed", async () => {
+  const bg = loadBackgroundHelpers();
+  bg.BiliWLDB.get = async () => deleteTarget;
+  bg.BiliWLDB.markRemoved = async () => assert.fail("must keep local record");
+  bg.requestWatchlaterRemove = async () => ({ code: 0 });
+  await assert.rejects(bg.removeFromWatchlaterUnlocked({ bvid: deleteTarget.bvid }), /未能核实/);
+});
+
+test("business or verification errors do not trigger a second deletion context", async () => {
+  const bg = loadBackgroundHelpers();
+  bg.getBiliCsrf = async () => "token";
+  bg.chrome.tabs.query = async () => [{ id: 3 }];
+  bg.requestWatchlaterRemoveFromPage = async () => { throw Object.assign(new Error("视频仍在列表中"), { retryable: false }); };
+  bg.performWatchlaterRemoval = async () => assert.fail("must not resend");
+  await assert.rejects(bg.requestWatchlaterRemove(123, deleteTarget.bvid), /视频仍在列表中/);
+});
+
 test("extension version is consistent across manifests", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(core.EXTENSION_VERSION, "1.2.0");
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  assert.equal(core.EXTENSION_VERSION, "1.3.0");
   assert.equal(manifest.version, core.EXTENSION_VERSION);
   assert.equal(pkg.version, core.EXTENSION_VERSION);
+  assert.match(readme, new RegExp("当前版本：" + core.EXTENSION_VERSION.replaceAll(".", "\\.")));
+});
+
+test("watchlater membership tasks run serially", async () => {
+  const background = loadBackgroundHelpers();
+  const events = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const first = background.runWatchlaterMembershipTask(async () => {
+    events.push("first-start");
+    await firstGate;
+    events.push("first-end");
+  });
+  const second = background.runWatchlaterMembershipTask(async () => {
+    events.push("second-start");
+  });
+  await Promise.resolve();
+  assert.deepEqual(events, ["first-start"]);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ["first-start", "first-end", "second-start"]);
 });
 
 function hslHue(value) {
@@ -553,9 +968,9 @@ test("dashboard consolidates AI classification, category generation and API sett
   assert.match(dashboard, /手动复制 Prompt/);
   assert.match(dashboard, /测试 API/);
   assert.match(dashboard, /textContent: "设置API"/);
-  assert.match(dashboard, /toggle-settings-panel/);
-  assert.match(dashboard, /toggle-api-settings/);
-  assert.match(dashboard, /自动 API 视频分类/);
+  assert.match(dashboard, /select-settings-page/);
+  assert.match(dashboard, /select-settings-tab/);
+  assert.match(dashboard, /自动分类条件/);
   assert.match(dashboard, /待精细分类达到指定数量/);
   assert.match(dashboard, /编辑分类目录/);
   assert.equal(dashboard.includes("手动编辑分类目录"), false);
@@ -564,24 +979,18 @@ test("dashboard consolidates AI classification, category generation and API sett
   assert.match(css, /\.exchange-panel textarea/);
 });
 
-test("dashboard renders watch progress and reorders category subtrees without automatic sync", () => {
+test("dashboard renders watch progress and removes category drag sorting", () => {
   const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
   const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
-  const reorderStart = background.indexOf("async function reorderCategory");
-  const deleteStart = background.indexOf("async function deleteCategory");
-  const reorderSource = background.slice(reorderStart, deleteStart);
   assert.match(dashboard, /view-count-badge/);
   assert.match(dashboard, /watch-progress-value/);
   assert.match(dashboard, /formatDuration\(watchProgress\) \+ "\/" \+ formatDuration\(duration\)/);
   assert.match(dashboard, /category-tree-group/);
-  assert.match(dashboard, /categoryDropTargetGroup/);
-  assert.match(dashboard, /event\.preventDefault\(\);[\s\S]*?categoryNav\.scrollTop \+= event\.deltaY/);
-  assert.equal(dashboard.includes('syncAfterCategoryStructureChange("分类顺序已更新")'), false);
-  assert.match(reorderSource, /message\.position === "after"/);
-  assert.match(reorderSource, /await getState\(\)/);
-  assert.equal(reorderSource.includes("stateAfterCategoryAutoClassify"), false);
-  assert.match(css, /\.category-tree-group\.drop-before::before/);
+  assert.doesNotMatch(dashboard, /categoryDropTargetGroup|category-drag-handle|draggable: true|onDragStart|REORDER_CATEGORY/);
+  assert.doesNotMatch(background, /reorderCategory|REORDER_CATEGORY/);
+  assert.equal(core.MESSAGE_TYPES.REORDER_CATEGORY, undefined);
+  assert.doesNotMatch(css, /drop-before|cursor: grab/);
   assert.match(css, /\.watch-progress-value/);
 });
 
@@ -590,9 +999,9 @@ test("dashboard exposes the manual default state and redesigned fixed batch cont
   const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
   assert.match(dashboard, /选择一种调整方式/);
   assert.match(dashboard, /event\.target === grid/);
-  assert.match(dashboard, /添加分类到选中视频/);
+  assert.match(dashboard, /添加所选分类到视频/);
   assert.match(dashboard, /清除选中视频中所有现有分类/);
-  assert.match(dashboard, /batch-category-swatch/);
+  assert.match(dashboard, /renderCategoryChoices\(batchCategoryIds, "batch-category"\)/);
   assert.match(css, /\.topbar[\s\S]*?position: sticky/);
   assert.match(css, /\.batch-panel[\s\S]*?grid-column: 1 \/ -1/);
   assert.match(css, /\.cover-wrap[\s\S]*?flex: 0 0 auto/);
@@ -608,20 +1017,21 @@ test("watchlater removal wiring is exposed in manifest background dashboard and 
   assert.equal(manifest.permissions.includes("tabs"), true);
   assert.equal(manifest.permissions.includes("scripting"), true);
   assert.equal(core.MESSAGE_TYPES.REMOVE_FROM_WATCHLATER, "REMOVE_FROM_WATCHLATER");
-  assert.equal(core.MESSAGE_TYPES.REMOVE_FROM_WATCHLATER_PAGE, "REMOVE_FROM_WATCHLATER_PAGE");
   assert.match(background, /REMOVE_FROM_WATCHLATER:[\s\S]*?removeFromWatchlater\(message\)/);
-  assert.match(background, /x\/v2\/history\/toview\/del/);
-  assert.match(background, /body\.set\("aid", String\(aid\)\)/);
-  assert.match(background, /referrer: "https:\/\/www\.bilibili\.com\/"/);
-  assert.match(background, /referrerPolicy: "strict-origin-when-cross-origin"/);
+  assert.match(background, /x\/v2\/history\/toview\/v2\/dels/);
+  assert.match(background, /body\.set\("resources", String\(aid\)\)/);
   assert.match(background, /requestWatchlaterRemoveFromPage/);
   assert.match(background, /chrome\.tabs\.query/);
   assert.match(background, /chrome\.scripting\.executeScript/);
   assert.match(background, /world: "MAIN"/);
-  assert.match(background, /await waitForTabComplete\(tab\.id\)/);
-  assert.match(background, /B站删除\|HTTP 412/);
-  assert.match(content, /REMOVE_FROM_WATCHLATER_PAGE/);
-  assert.match(content, /removeFromWatchlaterOnPage/);
+  assert.equal(background.includes("waitForTabComplete"), false);
+  const pageFallbackStart = background.indexOf("async function requestWatchlaterRemoveFromPage");
+  const pageFallbackEnd = background.indexOf("async function findBilibiliTab");
+  const pageFallbackSource = background.slice(pageFallbackStart, pageFallbackEnd);
+  assert.equal(pageFallbackSource.includes("chrome.tabs.create"), false);
+  assert.equal(pageFallbackSource.includes("chrome.tabs.remove"), false);
+  assert.match(background, /runWatchlaterMembershipTask\(\(\) => scanWatchlaterUnlocked\(message\)\)/);
+  assert.match(background, /runWatchlaterMembershipTask\(\(\) => removeFromWatchlaterUnlocked\(message\)\)/);
   assert.match(content, /card === link \|\| !card\.querySelector \|\| !card\.querySelector\("img"\)/);
   assert.equal(background.includes("csrf_token"), false);
   assert.match(dashboard, /remove-watchlater/);
@@ -631,6 +1041,10 @@ test("watchlater removal wiring is exposed in manifest background dashboard and 
   assert.match(dashboard, /title: "移出稍后再看"/);
   assert.match(dashboard, /"aria-label": "移出稍后再看"/);
   assert.match(dashboard, /video\.presentInWatchlater = false/);
+  assert.match(dashboard, /pendingRemovalBvids\.add\(bvid\)/);
+  assert.match(dashboard, /pendingRemovalBvids\.has\(video\.bvid\)/);
+  assert.match(dashboard, /confirmedRemovalBvids\.add\(bvid\)/);
+  assert.match(dashboard, /releaseConfirmedRemovals\(nextState\)/);
   assert.match(dashboard, /已从列表移除，正在向 B站确认/);
   assert.match(dashboard, /移出失败，视频已恢复/);
   assert.equal(dashboard.includes('title: "移出稍后再看？"'), false);
@@ -668,25 +1082,18 @@ test("manifest exposes blue extension icons and homepage dashboard entry", () =>
   assert.match(content, /OPEN_DASHBOARD/);
 });
 
-test("dashboard keeps stats in the right rail and removes duplicate video header", () => {
+test("dashboard gives browsing two columns and opens tools in dialogs without rail stats", () => {
   const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
-  const sidebarStart = dashboard.indexOf("function renderSidebar");
-  const statsStart = dashboard.indexOf("function renderStats");
-  const sidebarSource = dashboard.slice(sidebarStart, statsStart);
-  assert.equal(sidebarSource.includes("renderStats()"), false);
-  assert.equal(dashboard.includes("视频处理"), false);
-  assert.match(dashboard, /"全部视频"/);
-  assert.match(dashboard, /"待精细分类"/);
-  assert.match(dashboard, /"AI 已分类"/);
-  assert.match(dashboard, /"手动确认"/);
-  assert.match(dashboard, /pendingFineClassification/);
-  assert.match(dashboard, /aiClassified/);
-  assert.match(dashboard, /manualConfirmed/);
-  assert.equal(dashboard.includes('statNode((state.jobs || [])'), false);
-  assert.match(dashboard, /renderEditorHeader\(\)/);
-  assert.match(dashboard, /className: "activity-status status-" \+ kind/);
-  assert.match(css, /\.editor-sticky-header[\s\S]*position: sticky/);
+  assert.equal(dashboard.includes("function renderStats"), false);
+  assert.equal(dashboard.includes("renderEditorHeader()"), false);
+  assert.match(dashboard, /action: "open-management"/);
+  assert.match(dashboard, /className: "management-dialog editor"/);
+  assert.match(dashboard, /className: "content-title"/);
+  assert.match(dashboard, /cat-row category-root/);
+  assert.match(css, /grid-template-columns: 240px minmax\(0, 1fr\);/);
+  assert.match(css, /grid-template-columns: repeat\(5, minmax\(0, 1fr\)\);/);
+  assert.match(dashboard, /className: "activity-status feedback-notice status-" \+ kind/);
   assert.match(css, /\.activity-status\.status-error/);
 });
 
@@ -768,7 +1175,9 @@ test("fresh install onboarding detects login and exposes three first classificat
   assert.match(dashboard, /finishClassificationAndSync/);
   assert.match(css, /\.onboarding-overlay/);
   assert.match(css, /\.onboarding-banner/);
-  assert.equal(css.includes("backdrop-filter"), false);
+  const onboardingOverlayRule = css.match(/\.onboarding-overlay\s*\{[^}]*\}/)?.[0];
+  assert.ok(onboardingOverlayRule);
+  assert.doesNotMatch(onboardingOverlayRule, /backdrop-filter/);
 });
 
 test("onboarding category-list updates do not classify videos before step three", () => {

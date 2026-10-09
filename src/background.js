@@ -12,6 +12,7 @@ let detailRunPromise = null;
 let classificationRepairPromise = null;
 let initializationPromise = null;
 let autoLlmRunPromise = null;
+let watchlaterMembershipQueue = Promise.resolve();
 let progress = {
   status: "idle",
   message: "等待扫描",
@@ -106,8 +107,6 @@ async function handleMessage(message) {
       return deleteCategory(message);
     case core.MESSAGE_TYPES.SAVE_CATEGORIES:
       return saveCategories(message);
-    case core.MESSAGE_TYPES.REORDER_CATEGORY:
-      return reorderCategory(message);
     default:
       throw new Error("Unknown message type: " + message.type);
   }
@@ -165,6 +164,9 @@ async function ensureConfig() {
   }
   if (!Array.isArray(data.categories) || !data.categories.length) {
     updates.categories = core.DEFAULT_CATEGORIES.map((category) => Object.assign({}, category));
+  } else if (data.categories.some((category) => category.id === "other.todo" && category.name === "待整理")) {
+    updates.categories = data.categories.map((category) => category.id === "other.todo" && category.name === "待整理"
+      ? Object.assign({}, category, { name: "暂未归类" }) : category);
   }
   if (Object.keys(updates).length) {
     await chromeStorageSet(updates);
@@ -281,7 +283,8 @@ async function updateSettings(nextSettings) {
   if (Number.isFinite(Number(nextSettings.onboardingVersion))) {
     settings.onboardingVersion = Number(nextSettings.onboardingVersion);
   }
-  ["llmBaseUrl", "llmModel", "llmApiKey"].forEach((key) => {
+  if (["openai", "jev"].includes(nextSettings.classificationProvider)) settings.classificationProvider = nextSettings.classificationProvider;
+  ["llmBaseUrl", "llmModel", "llmApiKey", "jevApiKey", "jevModel"].forEach((key) => {
     if (Object.prototype.hasOwnProperty.call(nextSettings, key)) {
       settings[key] = core.normalizeText(nextSettings[key]);
     }
@@ -348,7 +351,7 @@ async function runScheduledLlmClassification(triggerName) {
   const startedAt = Date.now();
   setProgress({ status: "running", message: "正在自动进行 API 视频分类", running: 1, pending: counts.pending, done: 0, failed: 0 });
   try {
-    const result = await runAutomaticLlmBatches(settings);
+    const result = await runAutomaticLlmBatches(settings, triggerName === AUTO_LLM_CONTINUE_ALARM);
     await writeAutoLlmStatus({
       llmAutoClassifyLastRunAt: startedAt,
       llmAutoClassifyLastStatus: "自动分类完成：导入 " + result.imported + " 项，跳过 " + result.skipped + " 项" + (result.remaining ? "；剩余任务稍后继续" : ""),
@@ -368,27 +371,33 @@ async function runScheduledLlmClassification(triggerName) {
   }
 }
 
-async function runAutomaticLlmBatches(settings) {
-  const batchSize = Math.min(100, Math.max(1, Number(settings.llmBatchSize) || 50));
+async function runAutomaticLlmBatches(settings, continuing) {
+  const batchSize = Math.min(settings.classificationProvider === "jev" ? 5 : 100, Math.max(1, Number(settings.llmBatchSize) || 50));
+  const saved = continuing ? await chromeStorageGet(["autoLlmAttemptedBvids"]) : {};
+  const excludedBvids = Array.isArray(saved.autoLlmAttemptedBvids) ? saved.autoLlmAttemptedBvids.slice() : [];
   let imported = 0;
   let skipped = 0;
   let batches = 0;
   let remaining = 0;
   while (batches < AUTO_LLM_MAX_BATCHES_PER_WAKE) {
-    const exported = await exportClassifyBatch({ includeAll: false, limit: batchSize, offset: 0 });
+    const exported = await exportClassifyBatch({ includeAll: false, limit: batchSize, offset: 0, excludedBvids });
     remaining = exported.totalCandidates || 0;
     if (!exported.batchSize) break;
     setProgress({ message: "正在自动分类第 " + (batches + 1) + " 批，共 " + exported.batchSize + " 个视频", pending: remaining, running: 1 });
-    const payload = await callAutomaticLlm(settings, exported.prompt || "");
+    const payload = settings.classificationProvider === "jev"
+      ? await core.classifyWithJev(settings, exported.batchVideos, exported.categories, fetchWithTimeout)
+      : await callAutomaticLlm(settings, exported.prompt || "");
     const importedState = await importClassifications(JSON.stringify(payload), { mergeMode: "replace" });
     const importResult = importedState.importResult || {};
     imported += importResult.imported || 0;
     skipped += importResult.skipped || 0;
     batches += 1;
+    excludedBvids.push(...exported.batchVideos.map((video) => video.bvid));
+    await chromeStorageSet({ autoLlmAttemptedBvids: excludedBvids });
     if (!(importResult.imported || 0)) break;
   }
-  const latest = await db.summary();
-  remaining = core.classificationStageCounts(latest.videos, latest.classifications).pending;
+  const next = await exportClassifyBatch({ includeAll: false, limit: 1, excludedBvids });
+  remaining = next.totalCandidates || 0;
   if (remaining > 0 && batches >= AUTO_LLM_MAX_BATCHES_PER_WAKE) {
     chrome.alarms.create(AUTO_LLM_CONTINUE_ALARM, { delayInMinutes: 1 });
   }
@@ -470,7 +479,7 @@ function parseAutomaticJson(value) {
 }
 
 function apiConfigReady(settings) {
-  return Boolean(core.normalizeText(settings && settings.llmBaseUrl) && core.normalizeText(settings && settings.llmModel) && core.normalizeText(settings && settings.llmApiKey));
+  return core.classificationApiReady(settings);
 }
 
 async function writeAutoLlmStatus(patch) {
@@ -541,6 +550,10 @@ async function getState() {
 }
 
 async function scanWatchlater(message) {
+  return runWatchlaterMembershipTask(() => scanWatchlaterUnlocked(message));
+}
+
+async function scanWatchlaterUnlocked(message) {
   setProgress({ status: "running", message: "正在扫描稍后再看列表", running: 1 });
   let apiItems = [];
   let apiError = "";
@@ -667,6 +680,7 @@ async function fetchWatchlaterFromApi() {
   for (const url of endpoints) {
     try {
       const response = await fetch(url, {
+        signal: AbortSignal.timeout(10000),
         credentials: "include",
         headers: { "accept": "application/json,text/plain,*/*" }
       });
@@ -728,145 +742,215 @@ function convertBiliApiVideo(item, index) {
 }
 
 async function removeFromWatchlater(message) {
+  return runWatchlaterMembershipTask(() => removeFromWatchlaterUnlocked(message));
+}
+
+async function removeFromWatchlaterUnlocked(message) {
   const bvid = core.normalizeBvid(message && message.bvid);
   if (!bvid) throw new Error("缺少 bvid");
 
-  let video = await db.get("videos", bvid);
+  const video = await db.get("videos", bvid);
   if (!video) throw new Error("本地记录中没有这个视频：" + bvid);
-
-  let aid = video.aid || video.oid;
-  if (!aid) {
-    const details = await fetchVideoDetails(bvid);
-    const upsert = await db.upsertVideos([Object.assign({}, details, { bvid, presentInWatchlater: true })]);
-    video = upsert.results[0] ? upsert.results[0].video : Object.assign({}, video, details);
-    aid = video.aid || video.oid;
-  }
-  if (!aid) throw new Error("缺少 aid，无法从稍后再看移除：" + bvid);
-
-  await requestWatchlaterRemove(aid, bvid);
+  // Resolve the current aid from the server list, including unavailable videos.
+  const result = await requestWatchlaterRemove(video.aid || video.oid, bvid);
+  if (!result || result.verified !== true) throw new Error("未能核实 B站删除结果，请同步列表后重试");
   await db.markRemoved(bvid);
   return Object.assign(await getState(), {
-    removeResult: { bvid, aid }
+    removeResult: result
   });
 }
 
 async function requestWatchlaterRemove(aid, bvid) {
   const csrf = await getBiliCsrf();
+  let pageError = null;
   try {
-    await postWatchlaterRemove(aid, csrf);
+    const tab = await findBilibiliTab() || await loadExistingBilibiliTab();
+    if (tab) {
+      return await requestWatchlaterRemoveFromPage(aid, csrf, bvid, tab);
+    }
   } catch (error) {
-    if (!shouldRetryRemoveFromPage(error)) throw error;
-    await requestWatchlaterRemoveFromPage(aid, csrf, bvid);
+    if (error.retryable === false) throw error;
+    pageError = error;
   }
-}
-
-async function postWatchlaterRemove(aid, csrf) {
-  const body = new URLSearchParams();
-  body.set("aid", String(aid));
-  body.set("csrf", csrf);
-  const response = await fetch("https://api.bilibili.com/x/v2/history/toview/del", {
-    method: "POST",
-    credentials: "include",
-    referrer: "https://www.bilibili.com/",
-    referrerPolicy: "strict-origin-when-cross-origin",
-    headers: {
-      "accept": "application/json,text/plain,*/*",
-      "content-type": "application/x-www-form-urlencoded;charset=UTF-8"
-    },
-    body: body.toString()
-  });
-  if (!response.ok) {
-    throw new Error("B站删除接口 HTTP " + response.status);
-  }
-  const json = await response.json();
-  if (!json || json.code !== 0) {
-    throw new Error("B站删除失败：" + (json && json.message ? json.message : "code " + (json && json.code)));
-  }
-}
-
-function shouldRetryRemoveFromPage(error) {
-  const text = error && error.message ? error.message : String(error);
-  return /B站删除|HTTP 412|Failed to fetch|Referrer|referrer|CORS|TypeError/i.test(text);
-}
-
-async function requestWatchlaterRemoveFromPage(aid, csrf, bvid) {
-  let tab = await findWatchlaterTab();
-  let createdTab = false;
-  if (!tab) {
-    tab = await chrome.tabs.create({ url: "https://www.bilibili.com/watchlater/list#/list", active: false });
-    createdTab = true;
-  }
-
   try {
-    if (!tab || tab.id == null) throw new Error("无法打开 B站稍后再看页面");
-    await waitForTabComplete(tab.id);
-    await delay(createdTab ? 500 : 120);
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: "MAIN",
-      args: [{ aid, csrf, bvid }],
-      func: async (request) => {
-        const body = new URLSearchParams();
-        body.set("aid", String(request.aid));
-        body.set("csrf", request.csrf);
-        const response = await fetch("https://api.bilibili.com/x/v2/history/toview/del", {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "accept": "application/json,text/plain,*/*",
-            "content-type": "application/x-www-form-urlencoded;charset=UTF-8"
-          },
-          body: body.toString()
-        });
-        if (!response.ok) throw new Error("B站页面删除接口 HTTP " + response.status);
-        const json = await response.json();
-        if (!json || json.code !== 0) {
-          throw new Error("B站页面删除失败：" + (json && json.message ? json.message : "code " + (json && json.code)));
-        }
-        return { aid: request.aid, bvid: request.bvid, code: json.code };
-      }
-    });
-    if (!results || !results[0] || !results[0].result || results[0].result.code !== 0) {
-      throw new Error("B站页面删除请求没有返回成功结果");
-    }
-  } finally {
-    if (createdTab && tab && tab.id) {
-      chrome.tabs.remove(tab.id).catch(() => {});
-    }
+    return readWatchlaterRemovalResult(await performWatchlaterRemoval({ aid, csrf, bvid, deadline: Date.now() + 20000 }));
+  } catch (error) {
+    if (error.name === "TimeoutError") error = new Error("B站后台删除请求超时，请重试");
+    if (pageError) throw new Error(pageError.message + "；后台重试失败：" + error.message);
+    throw new Error("没有已加载的 B站页面可用于删除。请点击一个 B站首页或视频标签页，等页面内容显示后返回重试。后台请求失败：" + error.message);
   }
 }
 
-async function findWatchlaterTab() {
-  const tabs = await chrome.tabs.query({ url: "https://www.bilibili.com/watchlater/list*" });
-  return tabs && tabs.length ? tabs[0] : null;
+function readWatchlaterRemovalResult(result) {
+  if (result && result.verified === true) return result;
+  const error = new Error(result && result.error || "B站删除请求没有返回可核实的结果");
+  error.retryable = result && result.retryable;
+  throw error;
 }
 
-function waitForTabComplete(tabId) {
-  return new Promise((resolve, reject) => {
-    let done = false;
-    const timer = setTimeout(() => finish(new Error("等待 B站稍后再看页面加载超时")), 15000);
-    function finish(error) {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      chrome.tabs.onUpdated.removeListener(listener);
-      if (error) reject(error);
-      else resolve();
+async function requestWatchlaterRemoveFromPage(aid, csrf, bvid, tab) {
+  if (!tab || tab.id == null) {
+    throw new Error("B站限制了后台删除请求。请先打开任意 B站页面后重试；插件不会自动打开临时页面");
+  }
+  let timer;
+  const results = await Promise.race([chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    // This request only needs fetch/cookies. Waiting for all page resources can
+    // block deletion forever on tabs with stalled images or third-party scripts.
+    injectImmediately: true,
+    args: [{ aid, csrf, bvid, deadline: Date.now() + 20000 }],
+    func: performWatchlaterRemoval
+  }), new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error("B站页面无响应，请刷新该页面并同步列表后重试"), { retryable: false })), 22000);
+  })]).finally(() => clearTimeout(timer));
+  return readWatchlaterRemovalResult(results && results[0] && results[0].result);
+}
+
+// Self-contained: this exact function also runs in the Bilibili page's MAIN world.
+// Current official watchlater UI uses v2/dels + FormData(resources, csrf).
+async function performWatchlaterRemoval(request) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(0, request.deadline - Date.now()));
+  let postStarted = false;
+  let stage = "读取稍后再看列表";
+  function checkDeadline() {
+    if (Date.now() >= request.deadline || controller.signal.aborted) throw new Error("请求超时，请同步列表后重试");
+  }
+  async function api(path, options) {
+    checkDeadline();
+    const response = await fetch("https://api.bilibili.com" + path, Object.assign({
+      credentials: "include", cache: "no-store", signal: controller.signal
+    }, options));
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const json = await response.json();
+    if (!json || json.code !== 0) {
+      const code = json && json.code;
+      const advice = code === -101 ? "请先登录 B站" : code === -111 ? "登录凭据已变化，请刷新 B站页面后重试" : json && json.message || "未知错误";
+      throw Object.assign(new Error(advice + "（code " + code + "）"), { retryable: false });
     }
-    function listener(updatedTabId, info) {
-      if (updatedTabId === tabId && info.status === "complete") finish();
+    return json.data;
+  }
+  async function list() {
+    // This unfiltered endpoint returns the entire list; never treat an incomplete
+    // or malformed response as proof that a video is absent.
+    const data = await api("/x/v2/history/toview");
+    const items = data && (Array.isArray(data.list) ? data.list : data.count === 0 && data.list === null ? [] : null);
+    if (!items || !Number.isInteger(data.count) || data.count !== items.length ||
+        items.some((item) => !item || !Number.isSafeInteger(Number(item.aid)) || Number(item.aid) <= 0)) {
+      throw Object.assign(new Error("B站未返回完整列表，无法核实删除结果"), { retryable: false });
     }
-    chrome.tabs.onUpdated.addListener(listener);
-    chrome.tabs.get(tabId)
-      .then((tab) => {
-        if (tab && tab.status === "complete") finish();
+    return items;
+  }
+  try {
+    if (!/^BV[0-9A-Za-z]{10}$/.test(request.bvid)) throw Object.assign(new Error("视频编号无效"), { retryable: false });
+    const before = await list();
+    const target = before.find((item) => item.bvid === request.bvid);
+    if (!target) {
+      // A stale local aid must not target another video, or hide an invalid item
+      // which the server has returned without its bvid.
+      if (before.some((item) => Number(item.aid) === Number(request.aid))) {
+        throw Object.assign(new Error("视频编号与 B站列表不一致，请重新同步"), { retryable: false });
+      }
+      return { bvid: request.bvid, verified: true, alreadyAbsent: true };
+    }
+    const aid = Number(target.aid);
+    const pageCsrf = typeof document === "undefined" ? "" : (document.cookie.match(/(?:^|;\s*)bili_jct=([^;]+)/) || [])[1];
+    const csrf = pageCsrf || request.csrf;
+    if (!csrf) throw Object.assign(new Error("未找到登录凭据，请先登录 B站"), { retryable: false });
+    const body = new FormData();
+    body.set("resources", String(aid));
+    body.set("csrf", csrf);
+    stage = "移出稍后再看";
+    checkDeadline();
+    postStarted = true;
+    let postError;
+    try {
+      await api("/x/v2/history/toview/v2/dels", { method: "POST", body });
+    } catch (error) {
+      if (error.retryable === false) throw error;
+      postError = error; // The server may have applied a request whose response was lost.
+    }
+    stage = "核实删除结果";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise((resolve) => setTimeout(resolve, attempt * 400));
+      const after = await list();
+      if (!after.some((item) => item.bvid === request.bvid || Number(item.aid) === aid)) {
+        return { bvid: request.bvid, aid, verified: true };
+      }
+    }
+    throw new Error(postError ? postError.message + "；视频仍在 B站列表中" : "接口返回成功，但视频仍在 B站列表中，请稍后重试");
+  } catch (error) {
+    return { error: stage + "失败：" + (controller.signal.aborted ? "请求超时，请同步列表后重试" : error.message), retryable: !postStarted && error.retryable !== false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function findBilibiliTab() {
+  const candidates = await chrome.tabs.query({ url: "https://www.bilibili.com/*" });
+  // Restored tabs can be unloaded without being marked discarded or frozen.
+  const tabs = (candidates || []).filter((tab) => tab.status !== "unloaded" && !tab.discarded && !tab.frozen && tab.id != null);
+  if (!tabs.length) return null;
+  return tabs.find((tab) => tab.status === "complete" && tab.active) ||
+    tabs.find((tab) => tab.status === "complete") ||
+    tabs[0];
+}
+
+async function loadExistingBilibiliTab() {
+  const candidates = await chrome.tabs.query({ url: "https://www.bilibili.com/*" });
+  const candidate = (candidates || []).find((tab) => tab.id != null &&
+    (tab.status === "unloaded" || tab.discarded) && !tab.pendingUrl);
+  if (!candidate) return null;
+  // Recheck before reloading: the user may have started watching this tab.
+  const current = await chrome.tabs.get(candidate.id);
+  if (!/^https:\/\/www\.bilibili\.com\//.test(current.url || "") || current.pendingUrl) {
+    throw new Error("B站标签页正在跳转，请重试");
+  }
+  if (current.status === "unloaded" || current.discarded) {
+    // Reload the existing URL in the background; never activate or replace it.
+    await chrome.tabs.reload(current.id);
+  }
+  let timer;
+  const deadline = Date.now() + 12000;
+  try {
+    return await Promise.race([
+      (async () => {
+        while (Date.now() < deadline) {
+          const tab = await chrome.tabs.get(current.id);
+          if (!/^https:\/\/www\.bilibili\.com\//.test(tab.url || "") ||
+              tab.pendingUrl && !/^https:\/\/www\.bilibili\.com\//.test(tab.pendingUrl)) {
+            throw new Error("B站标签页正在跳转，请重试");
+          }
+          if (tab.status !== "unloaded" && !tab.discarded && !tab.frozen) {
+            try {
+              // Probe the committed document, not the tab's cached URL or load event.
+              const results = await chrome.scripting.executeScript({
+                target: { tabId: tab.id }, world: "MAIN", injectImmediately: true,
+                func: () => location.origin === "https://www.bilibili.com"
+              });
+              if (results && results[0] && results[0].result === true) return tab;
+            } catch (_) {
+              // A restored tab can briefly retain its empty initial document.
+            }
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        throw new Error("后台加载 B站页面超时，请检查网络后重试");
+      })(),
+      new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("后台加载 B站页面超时，请检查网络后重试")), 12000);
       })
-      .catch(finish);
-  });
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function runWatchlaterMembershipTask(task) {
+  const result = watchlaterMembershipQueue.then(task, task);
+  watchlaterMembershipQueue = result.catch(() => {});
+  return result;
 }
 
 async function getBiliCsrf() {
@@ -1120,7 +1204,8 @@ function normalizeImportedCategories(payload, options) {
   const seen = new Set();
   items.forEach((item, index) => {
     const id = core.normalizeText(item && item.id).toLowerCase();
-    const name = core.truncateText(item && item.name, 30);
+    const rawName = core.truncateText(item && item.name, 30);
+    const name = id === "other.todo" && rawName === "待整理" ? "暂未归类" : rawName;
     const parentId = core.normalizeText(item && item.parentId).toLowerCase();
     if (!id || !/^[\p{L}\p{N}][\p{L}\p{N}._-]{0,79}$/u.test(id)) {
       throw new Error("分类 id 不合法：" + (id || "第 " + (index + 1) + " 项"));
@@ -1179,8 +1264,10 @@ async function exportClassifyBatch(message) {
   const summary = await db.summary();
   const classificationByBvid = new Map(summary.classifications.map((item) => [item.bvid, item]));
   const includeAll = Boolean(message.includeAll);
+  const excludedBvids = new Set(message.excludedBvids || []);
   const offset = Math.max(0, Number(message.offset || 0));
   let candidates = summary.videos
+    .filter((video) => !excludedBvids.has(video.bvid))
     .filter((video) => video.presentInWatchlater !== false)
     .filter((video) => {
       const classification = classificationByBvid.get(video.bvid);
@@ -1198,6 +1285,7 @@ async function exportClassifyBatch(message) {
       compact: Boolean(message.compact)
     })),
     batchVideos: batch,
+    categories: config.categories,
     countRemaining: Math.max(0, candidates.length - offset),
     totalCandidates: candidates.length,
     offset,
@@ -1400,8 +1488,11 @@ async function bulkUpdateClassifications(message) {
   const validIds = new Set(config.categories.filter((category) => category.enabled !== false).map((category) => category.id));
   const videos = await db.getAll("videos");
   const videosByBvid = new Map(videos.map((video) => [video.bvid, video]));
-  const categoryId = core.normalizeText(message.categoryId);
-  if (action === "add" && !validIds.has(categoryId)) throw new Error("请选择有效分类");
+  const selectedCategoryIds = core.uniqueStrings(message.categoryIds);
+  if (!["add", "clear"].includes(action)) throw new Error("无效的批量操作");
+  if (action === "add" && (!selectedCategoryIds.length || selectedCategoryIds.some(id => !validIds.has(id)))) {
+    throw new Error("请选择有效分类");
+  }
 
   let updated = 0;
   for (const bvid of bvids) {
@@ -1410,7 +1501,7 @@ async function bulkUpdateClassifications(message) {
     const existing = await db.getClassification(bvid);
     const categoryIds = action === "clear"
       ? []
-      : core.uniqueStrings([...(existing && existing.categoryIds || []), categoryId]).filter((id) => validIds.has(id));
+      : core.uniqueStrings([...(existing && existing.categoryIds || []), ...selectedCategoryIds]).filter((id) => validIds.has(id));
     const classification = core.mergeClassification(existing, {
       bvid,
       categoryIds,
@@ -1534,34 +1625,6 @@ async function updateCategory(message) {
 
   await chromeStorageSet({ categories });
   return Object.assign(await stateAfterCategoryAutoClassify(message), { updatedCategory: category });
-}
-
-async function reorderCategory(message) {
-  const config = await getConfig();
-  const id = core.normalizeText(message.id);
-  const targetId = core.normalizeText(message.targetId);
-  if (!id || !targetId || id === targetId) throw new Error("缺少有效排序目标");
-  const categories = config.categories.map((category) => Object.assign({}, category));
-  const category = categories.find((item) => item.id === id && item.enabled !== false);
-  const target = categories.find((item) => item.id === targetId && item.enabled !== false);
-  if (!category || !target) throw new Error("分类不存在");
-  if ((category.parentId || "") !== (target.parentId || "")) {
-    throw new Error("只能在同一级分类内拖动排序；改变等级请用编辑分类目录");
-  }
-
-  const parentId = category.parentId || "";
-  const siblings = categories
-    .filter((item) => item.enabled !== false && (item.parentId || "") === parentId && item.id !== id)
-    .sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name));
-  const targetIndex = Math.max(0, siblings.findIndex((item) => item.id === targetId));
-  const insertIndex = message.position === "after" ? targetIndex + 1 : targetIndex;
-  siblings.splice(insertIndex, 0, category);
-  siblings.forEach((item, index) => {
-    item.order = (index + 1) * 10;
-  });
-
-  await chromeStorageSet({ categories });
-  return Object.assign(await getState(), { reorderedCategory: { id, targetId, position: message.position === "after" ? "after" : "before" } });
 }
 
 async function deleteCategory(message) {

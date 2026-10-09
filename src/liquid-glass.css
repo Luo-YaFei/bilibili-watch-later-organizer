@@ -1,0 +1,255 @@
+/* Project skin for the MIT dpawlikowski/liquid-glass core.
+ * Load vendor/liquid-glass/liquid-glass.css first. Use --simple on all
+ * routine controls: no SVG displacement, scene copies, or running animation.
+ * Panels own the main blur; their controls need only a small blur radius.
+ */
+:root {
+  --tinted-glass-blur: 2px;
+  --tinted-glass-saturate: 115%;
+  --tinted-glass-shadow: 0 2px 6px rgb(30 47 62 / .045);
+}
+
+/* Buttons and notices share one transparent material, with per-state hues. */
+.liquid-glass.glass-tinted,
+.feedback-notice {
+  --tinted-glass-background: linear-gradient(155deg, rgb(var(--tinted-highlight-rgb) / .35), rgb(var(--tinted-color-rgb) / .08) 60%, rgb(var(--tinted-base-rgb) / .18));
+}
+.liquid-glass.glass-panel,
+.liquid-glass.glass-control {
+  --lg-tint: 255 255 255;
+  --lg-saturate: 115%;
+  --lg-opacity: .06;
+  --lg-border-opacity: .18;
+  --lg-edge-red: rgb(232 179 195 / .10);
+  --lg-edge-cyan: rgb(139 193 212 / .12);
+  --lg-shadow: 0 2px 6px rgb(30 47 62 / .045);
+  color: var(--ink, #303940);
+  background: linear-gradient(155deg, rgb(255 255 255 / .30), rgb(247 250 253 / .05) 48%, rgb(226 237 246 / .12));
+  box-shadow: var(--lg-shadow), inset 0 1px 0 rgb(255 255 255 / .32);
+  animation: none;
+}
+
+.liquid-glass.glass-panel {
+  --lg-radius: var(--radius-panel, 24px);
+  --lg-blur: 10px;
+  --lg-opacity: .12;
+  --lg-shadow: 0 4px 16px rgb(30 47 62 / .04);
+  /* Native picker top layers and expanded batch tools must not be clipped. */
+  overflow: visible;
+}
+
+.liquid-glass.glass-control {
+  --lg-radius: var(--radius, 12px);
+  --lg-blur: 2px;
+  height: 36px;
+  min-height: 36px;
+  border-radius: var(--lg-radius);
+}
+
+button.liquid-glass.glass-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  white-space: nowrap;
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+
+button.liquid-glass.glass-control:not(:disabled):hover {
+  background: linear-gradient(155deg, rgb(255 255 255 / .44), rgb(242 248 253 / .16));
+  box-shadow: 0 3px 9px rgb(30 47 62 / .08), inset 0 1px 0 rgb(255 255 255 / .45);
+}
+
+button.liquid-glass.glass-control:not(:disabled):active {
+  transform: scale(.97);
+  box-shadow: inset 0 1px 3px rgb(30 47 62 / .08);
+}
+
+button.liquid-glass.glass-control:disabled { opacity: .42; cursor: default; }
+.liquid-glass.glass-control:focus-visible {
+  outline: 2px solid rgb(65 107 135 / .52);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgb(132 181 213 / .10), inset 0 1px 0 rgb(255 255 255 / .65);
+}
+.glass-search:focus-within {
+  outline: none;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .65);
+}
+.glass-search:has(.search-input:focus-visible) { outline: none; }
+.glass-search .search-input::selection { background: rgb(135 188 222 / .38); color: #183d56; }
+
+.liquid-glass.glass-tinted {
+  --tinted-highlight-rgb: 237 255 246;
+  --tinted-color-rgb: 57 189 136;
+  --tinted-base-rgb: 214 241 230;
+  --lg-blur: var(--tinted-glass-blur);
+  --lg-saturate: var(--tinted-glass-saturate);
+  --lg-tint: 218 245 232;
+  --lg-opacity: .08;
+  color: #216b4c;
+  background: var(--tinted-glass-background);
+  box-shadow: var(--tinted-glass-shadow), inset 0 1px 0 rgb(255 255 255 / .32);
+}
+
+button.liquid-glass.glass-tinted:not(:disabled):hover {
+  background: linear-gradient(155deg, rgb(243 255 249 / .44), rgb(57 189 136 / .14));
+}
+
+.glass-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  min-width: 0;
+}
+.glass-search > svg { flex: 0 0 17px; width: 17px; height: 17px; color: var(--muted, #68737c); }
+.glass-search > * { position: relative; z-index: 2; }
+.glass-search .search-input {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  color: var(--ink, #303940);
+  outline: none;
+}
+.glass-search .search-input::placeholder { color: var(--muted, #68737c); }
+/* Override the older high-specificity input focus rule in dashboard.css. */
+.topbar .glass-search .search-input:is(:focus, :focus-visible) {
+  border: 0;
+  outline: none;
+  background: transparent;
+  box-shadow: none;
+}
+.glass-search .search-input::-webkit-search-cancel-button {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-left: 6px;
+  background: #5485a3;
+  mask: url("../icons/lucide/x.svg") center / contain no-repeat;
+  cursor: pointer;
+}
+
+.glass-select {
+  appearance: base-select;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+  padding: 0 12px;
+  font-size: 13px;
+}
+.glass-select::picker(select) {
+  appearance: base-select;
+  margin-block: 8px;
+  padding: 6px;
+  border: 1px solid rgb(255 255 255 / .30);
+  border-radius: var(--radius-menu, 18px);
+  background: linear-gradient(155deg, rgb(255 255 255 / .92), rgb(235 244 251 / .87));
+  backdrop-filter: blur(12px) saturate(115%);
+  box-shadow: 0 6px 20px rgb(30 47 62 / .09), inset 0 1px 0 rgb(255 255 255 / .4);
+  color: var(--ink, #303940);
+}
+.glass-select::picker-icon { content: ""; color: var(--muted, #68737c); align-self: center; width: 13px; height: 13px; background: currentColor; mask: url("../icons/lucide/chevron-down.svg") center / contain no-repeat; }
+.toolbar .glass-select option::checkmark { content: ""; width: 14px; height: 14px; background: currentColor; mask: url("../icons/lucide/check.svg") center / contain no-repeat; }
+.toolbar .glass-select option { min-height: 36px; border-radius: var(--radius, 12px); }
+.toolbar .glass-select option:is(:hover, :focus-visible) {
+  outline: none;
+  background: linear-gradient(155deg, rgb(255 255 255 / .48), rgb(169 208 233 / .18));
+  box-shadow: inset 0 0 0 1px rgb(90 139 172 / .24);
+}
+.toolbar .glass-select option:checked {
+  background: linear-gradient(155deg, rgb(228 244 255 / .62), rgb(155 198 225 / .24));
+  color: #294d68;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .72), inset 0 0 0 1px rgb(110 154 186 / .15);
+}
+
+/* One unbroken row; compact actions before allowing horizontal scrolling. */
+.main { container-type: inline-size; }
+.topbar { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.topbar .toolbar { display: flex; flex-wrap: nowrap; width: 100%; min-width: 0; justify-content: flex-start; align-items: center; gap: 8px; overflow-x: auto; padding: 4px; scrollbar-width: thin; }
+.toolbar-find {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.toolbar-find .glass-search { width: clamp(260px, 25cqw, 320px); flex: 0 0 clamp(260px, 25cqw, 320px); }
+.toolbar-find .glass-select { width: 112px; }
+.toolbar-find [data-role="sort-combo"] { width: 126px; }
+.toolbar-divider { display: block; flex: 0 0 2px; width: 2px; height: 22px; align-self: center; margin-inline: 4px; border-radius: 1px; background: linear-gradient(90deg, rgb(255 255 255 / .92), rgb(221 244 255 / .52)); box-shadow: 0 0 3px rgb(255 255 255 / .28); }
+.toolbar-maintenance,
+.toolbar-navigation { display: flex; align-items: center; flex-wrap: nowrap; gap: 6px; }
+.toolbar-maintenance { flex: 0 0 auto; }
+.toolbar-navigation { flex: 0 0 auto; }
+.toolbar-find + .toolbar-divider { margin-left: auto; }
+.toolbar .glass-control svg { position: relative; z-index: 2; width: 18px; height: 18px; flex: 0 0 auto; }
+.toolbar .glass-control span { position: relative; z-index: 2; }
+.toolbar button { font-size: 13px; }
+.toolbar .sync-button { font-weight: 600; }
+.toolbar .batch-button[aria-pressed="true"] { background: linear-gradient(155deg, rgb(221 242 255 / .42), rgb(128 183 217 / .16)); color: #294d68; box-shadow: inset 0 0 0 1px rgb(84 142 177 / .30), inset 0 1px 0 rgb(255 255 255 / .7); }
+.toolbar :is(.shuffle-button, .settings-button, .toolbar-icon-button) { width: 36px; min-width: 36px; padding: 0; }
+.toolbar button.toolbar-icon-button.glass-control { display: grid; place-items: center; }
+.toolbar button.toolbar-icon-button.glass-control svg { display: block; margin: 0; align-self: center; justify-self: center; }
+.toolbar-icon-button[data-action="open-bili-home"] { color: #d34377; }
+.toolbar-icon-button[data-action="open-watchlater"] { color: #0086b8; }
+.toolbar-icon-button[data-action="open-bili-dynamic"] { color: #a67808; }
+.select-mark .ui-icon { width: 16px; height: 16px; }
+.manual-editor-default-icon .ui-icon { width: 22px; height: 22px; }
+.modal-close { display: inline-grid; place-items: center; }
+.modal-close .ui-icon { width: 18px; height: 18px; }
+
+@container (max-width: 960px) {
+  .toolbar-find .glass-search { width: 240px; flex-basis: 240px; }
+  .toolbar-find .glass-select { width: 100px; }
+  .toolbar-find [data-role="sort-combo"] { width: 116px; }
+  .toolbar-maintenance button { width: 36px; min-width: 36px; padding: 0; }
+  .toolbar-maintenance button span { display: none; }
+  .toolbar-divider { margin-inline: 0; }
+  .topbar .toolbar { gap: 6px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button.liquid-glass.glass-control { transition: none; }
+  button.liquid-glass.glass-control:not(:disabled):active { transform: none; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .liquid-glass.glass-panel,
+  .liquid-glass.glass-control,
+  button.liquid-glass.glass-control:not(:disabled):hover,
+  .glass-select::picker(select) { background: #f7f9fb; backdrop-filter: none; -webkit-backdrop-filter: none; box-shadow: none; }
+  .liquid-glass::before,
+  .liquid-glass::after { display: none; }
+}
+@media (forced-colors: active) {
+  .liquid-glass.glass-panel,
+  .liquid-glass.glass-control,
+  button.liquid-glass.glass-control:not(:disabled):hover,
+  .glass-select::picker(select) { background: Canvas; color: ButtonText; border: 1px solid ButtonText; backdrop-filter: none; box-shadow: none; }
+  .liquid-glass::before,
+  .liquid-glass::after { display: none; }
+  .glass-search .search-input { color: CanvasText; }
+  .glass-search:focus-within,
+  .liquid-glass.glass-control:focus-visible { outline-color: Highlight; }
+  .glass-search:has(.search-input:focus-visible) { outline-color: Highlight; }
+  .toolbar-divider { background: CanvasText; box-shadow: none; }
+}
+
+
+.list-head .search-scope-hint { flex: none; padding: 4px 9px; border-radius: var(--radius-sm); background: #e1e7eb; font-size: 12px; font-weight: 600; color: #52616b; white-space: nowrap; }
+.search-scope-hint[hidden] { display: none; }
+@media (forced-colors: active) {
+  .glass-search:has(.search-input:focus-visible) { outline: 1px solid Highlight; }
+  .search-scope-hint { color: CanvasText; }
+}
