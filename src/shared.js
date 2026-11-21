@@ -1,7 +1,8 @@
 (function attachBiliWatchLaterCore(root) {
   "use strict";
 
-  const EXTENSION_VERSION = "1.3.0";
+  const EXTENSION_VERSION = "1.4.0";
+  const INITIAL_LIBRARY_SYNC_KEY = "initial-library-sync";
   const CLASSIFIER_VERSION = "manual-llm-json-v1";
   const LOCAL_CLASSIFIER_VERSION = "local-rules-v1";
   const CLASSIFICATION_SOURCE_TYPES = Object.freeze({
@@ -15,6 +16,7 @@
     SCAN_WATCHLATER: "SCAN_WATCHLATER",
     UPSERT_VIDEO_ITEMS: "UPSERT_VIDEO_ITEMS",
     FETCH_VIDEO_DETAILS: "FETCH_VIDEO_DETAILS",
+    DETAILS_SAVED: "DETAILS_SAVED",
     EXPORT_CATEGORY_PROPOSAL: "EXPORT_CATEGORY_PROPOSAL",
     IMPORT_CATEGORIES: "IMPORT_CATEGORIES",
     EXPORT_CLASSIFY_BATCH: "EXPORT_CLASSIFY_BATCH",
@@ -39,6 +41,11 @@
   const DEFAULT_SETTINGS = Object.freeze({
     sortMode: "watchlater",
     sortDirection: "desc",
+    defaultOpeningCategory: "",
+    defaultVideoFilter: "",
+    shuffleOnOpen: false,
+    resultBatchSize: 200,
+    showCommentLocation: false,
     batchSize: 80,
     manualExportLimit: 80,
     detailConcurrency: 3,
@@ -60,6 +67,17 @@
     llmAutoClassifyLastStatus: "",
     llmAutoClassifyLastImported: 0
   });
+
+  const VIDEO_FILTER_OPTIONS = [
+    ["", "全部时长"],
+    ["duration-120", "2分钟以内"],
+    ["duration-300", "5分钟以内"],
+    ["duration-600", "10分钟以内"],
+    ["duration-1800", "30分钟以内"],
+    ["duration-3600-plus", "1小时以上"],
+    ["partially-played", "部分播放"]
+  ];
+  const RESULT_BATCH_SIZE_RANGE = Object.freeze({ min: 1, max: 1000 });
 
   const DEFAULT_CATEGORIES = Object.freeze([
     { id: "study", name: "学习与知识", order: 10, enabled: true },
@@ -240,6 +258,14 @@
     return isUsefulValue(nextValue) ? nextValue : oldValue;
   }
 
+  function setAuthoritativeWatchlaterMembership(video, present) {
+    // Membership changes on the server or after verified removal, independently of detail updates.
+    if (video.presentInWatchlater !== present || !video.watchlaterMembershipRevision) {
+      video.watchlaterMembershipRevision = (video.watchlaterMembershipRevision || 0) + 1;
+    }
+    video.presentInWatchlater = present;
+  }
+
   function canonicalizeVideo(input, existing, options) {
     const now = options && options.now ? options.now : Date.now();
     const bvid = normalizeBvid(input && (input.bvid || input.pageUrl));
@@ -280,7 +306,12 @@
     merged.watchlaterAddedAt = pickUseful(toNumberOrUndefined(input && input.watchlaterAddedAt), merged.watchlaterAddedAt);
     merged.watchlaterOrder = pickUseful(toNumberOrUndefined(input && input.watchlaterOrder), merged.watchlaterOrder);
     merged.pageParts = pickUseful(uniqueStrings(input && input.pageParts), merged.pageParts) || [];
-    if (input && Object.prototype.hasOwnProperty.call(input, "presentInWatchlater")) {
+    if (Number.isFinite(input?.detailViewCheckedAt)) merged.detailViewCheckedAt = input.detailViewCheckedAt;
+    if (Number.isFinite(input?.detailCheckedAt)) merged.detailCheckedAt = input.detailCheckedAt;
+    if (options?.authoritativeWatchlater) {
+      setAuthoritativeWatchlaterMembership(merged, input.presentInWatchlater !== false);
+    } else if (input && Object.prototype.hasOwnProperty.call(input, "presentInWatchlater") &&
+        existing?.presentInWatchlater !== false && !existing?.watchlaterMembershipRevision) {
       merged.presentInWatchlater = input.presentInWatchlater !== false;
     } else if (!existing || typeof existing.presentInWatchlater !== "boolean") {
       merged.presentInWatchlater = true;
@@ -396,21 +427,103 @@
     };
   }
 
+  function finiteNumberOrNull(value) {
+    if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function normalizeResultBatchSize(value) {
+    const size = finiteNumberOrNull(value) ?? DEFAULT_SETTINGS.resultBatchSize;
+    return Math.min(RESULT_BATCH_SIZE_RANGE.max, Math.max(RESULT_BATCH_SIZE_RANGE.min, Math.floor(size)));
+  }
+
+  function retryAfterAt(response) {
+    const value = response.headers?.get("retry-after");
+    const seconds = finiteNumberOrNull(value);
+    return seconds !== null ? Date.now() + Math.max(0, seconds) * 1000 : Date.parse(value) || 0;
+  }
+
+  function classificationApiError(response, message) {
+    return Object.assign(new Error(message), {
+      status: response.status,
+      retryAt: retryAfterAt(response),
+      fatal: [401, 402, 403, 404].includes(response.status) ||
+        /insufficient[_ ](?:quota|funds|credits|balance)|model[_ ](?:not[_ ]found|does not exist|not supported)|invalid[_ ]api[_ ]key|额度不足|余额不足|模型不存在/i.test(message)
+    });
+  }
+
+  function parseAiJson(value) {
+    const raw = String(value ?? "").replace(/^\uFEFF/, "").trim();
+    if (!raw) throw new Error("JSON 内容为空");
+    try { return JSON.parse(raw); } catch {}
+    const fenced = raw.match(/^\s*\x60{3}(?:json)?\s*([\s\S]*?)\x60{3}\s*$/im);
+    const candidate = fenced ? fenced[1].trim() : raw;
+    try { return JSON.parse(candidate); } catch {}
+    const start = candidate.search(/[\[{]/);
+    if (start < 0) throw new Error("AI 返回的内容没有 JSON 对象或数组");
+    let output = "";
+    let depth = 0;
+    for (let index = start; index < candidate.length; index++) {
+      const ch = candidate[index];
+      if (ch === '"' || ch === "'") {
+        let end = index + 1;
+        let body = "";
+        while (end < candidate.length && candidate[end] !== ch) {
+          const char = candidate[end++];
+          if (char === "\\" && end < candidate.length) {
+            const escaped = candidate[end++];
+            body += ch === "'" && escaped === "'" ? escaped : "\\" + escaped;
+          } else {
+            body += ch === "'" && char === '"' ? '\\"' : char;
+          }
+        }
+        if (end === candidate.length) break;
+        output += ch === '"' ? candidate.slice(index, end + 1) : '"' + body + '"';
+        index = end;
+        continue;
+      }
+      if (ch === "," && /^\s*[\]}]/.test(candidate.slice(index + 1))) continue;
+      if (ch === "{" || ch === "[") depth++;
+      if (ch === "}" || ch === "]") depth--;
+      const key = /[A-Za-z_$]/.test(ch) && /[{,]\s*$/.test(output) &&
+        candidate.slice(index).match(/^([A-Za-z_$][\w$-]*)(\s*:)/);
+      if (key) {
+        output += JSON.stringify(key[1]) + key[2];
+        index += key[0].length - 1;
+      } else {
+        output += ch;
+      }
+      if (depth === 0) {
+        try { return JSON.parse(output); } catch (error) {
+          throw new Error("AI 返回的内容不是有效 JSON：" + error.message);
+        }
+      }
+    }
+    throw new Error("AI 返回的 JSON 不完整");
+  }
+
+  function classificationItems(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.items)) return payload.items;
+    return Array.isArray(payload?.classifications) ? payload.classifications : [];
+  }
+
+  function normalizeLlmPayload(payload) {
+    const items = classificationItems(payload);
+    if (!items.length) throw new Error("AI 返回的 JSON 没有视频分类数组");
+    return { items };
+  }
+
   function parseClassificationPayload(payload) {
     let parsed = payload;
     if (typeof payload === "string") {
       const text = payload.trim();
       if (!text) return { items: [], warnings: ["导入内容为空"] };
-      parsed = JSON.parse(text);
+      parsed = parseAiJson(text);
     }
 
-    const rawItems = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed && parsed.items)
-        ? parsed.items
-        : Array.isArray(parsed && parsed.classifications)
-          ? parsed.classifications
-          : [];
+    const rawItems = classificationItems(parsed);
 
     if (!rawItems.length) {
       return { items: [], warnings: ["没有找到 items/classifications 数组"] };
@@ -470,12 +583,30 @@
 
   function categoryPath(category, categoryById) {
     const names = [];
+    const visited = new Set();
     let current = category;
-    while (current) {
+    while (current && !visited.has(current.id)) {
+      visited.add(current.id);
       names.unshift(current.name);
       current = current.parentId ? categoryById.get(current.parentId) : null;
     }
     return names.join("/");
+  }
+
+  function normalizeOpeningCategory(value, categories) {
+    if (value === "pending") return value;
+    if (typeof value !== "string" || !value.startsWith("category:")) return "";
+    const byId = categoryById(categories);
+    const visited = new Set();
+    let id = value.slice("category:".length);
+    if (!id) return "";
+    while (id) {
+      const category = byId.get(id);
+      if (!category || category.enabled === false || visited.has(id)) return "";
+      visited.add(id);
+      id = category.parentId;
+    }
+    return value;
   }
 
   function flattenCategoryLines(categories) {
@@ -941,10 +1072,10 @@
       if (![429, 529].includes(response.status) || attempt === 2) break;
       const retryAfter = response.headers && response.headers.get("retry-after");
       const delay = retryAfter ? (Number.isFinite(Number(retryAfter)) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - Date.now()) : 1000 * (2 ** attempt);
-      if (delay > 10000) throw new Error("Jev 请求限流，请稍后重试（HTTP " + response.status + "）");
+      if (delay > 10000) throw classificationApiError(response, "Jev 请求限流，请稍后重试（HTTP " + response.status + "）");
       await new Promise((resolve) => setTimeout(resolve, Math.max(1000, delay || 1000)));
     }
-    if (!response.ok) throw new Error("Jev API HTTP " + response.status + "；请检查密钥、模型、余额或请求限制");
+    if (!response.ok) throw classificationApiError(response, "Jev API HTTP " + response.status + "；请检查密钥、模型、余额或请求限制");
     return parseJevResponse(await response.json(), videos, request);
   }
 
@@ -1028,7 +1159,7 @@
     if (settings.videoFilter === "duration-600" && !(duration > 0 && duration <= 600)) return false;
     if (settings.videoFilter === "duration-1800" && !(duration > 0 && duration <= 1800)) return false;
     if (settings.videoFilter === "duration-3600-plus" && duration < 3600) return false;
-    if (settings.videoFilter === "partially-played" && !(watchProgress > 0 && video.isWatched !== true && (duration <= 0 || watchProgress < duration))) return false;
+    if (settings.videoFilter === "partially-played" && !(watchProgress > 0 || video.isWatched === true)) return false;
 
     const categoryIds = new Set(settings.categoryIds || []);
     const hasCategoryFilter = categoryIds.size > 0;
@@ -1040,6 +1171,24 @@
     return ownCategoryIds.some((id) => categoryIds.has(id));
   }
 
+  // CDN image formatting: bilibili-API-collect/docs/misc/picture.md.
+  function coverThumbnailUrl(value) {
+    const original = normalizeText(value);
+    try {
+      const url = new URL(original.startsWith("//") ? "https:" + original : original);
+      if (!/^https?:$/.test(url.protocol) || !/(^|\.)(hdslb|biliimg)\.com$/i.test(url.hostname)
+        || !url.pathname.startsWith("/bfs/") || url.search) return original;
+      const pathname = url.pathname.split("@")[0];
+      if (!/\.(jpe?g|png|webp|avif)$/i.test(pathname)) return original;
+      url.protocol = "https:";
+      url.pathname = pathname + "@640w_360h_1c_85q.webp";
+      url.hash = "";
+      return url.href;
+    } catch {
+      return original;
+    }
+  }
+
   const api = Object.freeze({
     EXTENSION_VERSION,
     CLASSIFIER_VERSION,
@@ -1047,6 +1196,10 @@
     CLASSIFICATION_SOURCE_TYPES,
     MESSAGE_TYPES,
     DEFAULT_SETTINGS,
+    VIDEO_FILTER_OPTIONS,
+    RESULT_BATCH_SIZE_RANGE,
+    normalizeResultBatchSize,
+    INITIAL_LIBRARY_SYNC_KEY,
     DEFAULT_CATEGORIES,
     normalizeText,
     truncateText,
@@ -1054,10 +1207,12 @@
     extractBvid,
     standardVideoUrl,
     watchlaterPlaybackUrl,
+    coverThumbnailUrl,
     uniqueStrings,
     stableJson,
     computeSourceHash,
     canonicalizeVideo,
+    setAuthoritativeWatchlaterMembership,
     classificationSourceType,
     isManualClassification,
     classifyStatus,
@@ -1067,9 +1222,15 @@
     classificationStageCounts,
     mergeClassification,
     parseClassificationPayload,
+    parseAiJson,
+    normalizeLlmPayload,
+    finiteNumberOrNull,
+    retryAfterAt,
+    classificationApiError,
     validateClassificationItems,
     childrenOf,
     categoryPath,
+    normalizeOpeningCategory,
     categoryById,
     categoryColorTokens,
     categoryIdFromName,

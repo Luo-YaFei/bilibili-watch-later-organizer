@@ -2,7 +2,7 @@
 
 **Extension:** Bilibili Watch Later Organizer
 **Effective date:** July 11, 2026
-**Last updated:** October 9, 2026
+**Last updated:** November 18, 2026
 
 ## AI service update / AI 服务更新
 
@@ -42,6 +42,7 @@ The Extension may store the following information in browser extension storage:
 
 * User-created categories and category structures
 * Video classification results
+* Video cover images for offline display. Cover requests go directly to Bilibili's image servers without login cookies.
 * Keyword rules
 * Extension preferences and settings
 * User-provided OpenRouter API key
@@ -241,6 +242,7 @@ Bilibili Watch Later Organizer（以下简称“本扩展”）是一款独立�
 
 * 用户创建的分类和分类结构
 * 视频分类结果
+* 用于离线显示的视频封面。封面请求直接发送到哔哩哔哩的图片服务器，且不携带登录 Cookie。
 * 关键词规则
 * 扩展偏好和设置
 * 用户自行提供的 OpenRouter API Key

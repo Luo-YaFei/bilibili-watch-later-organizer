@@ -1,3 +1,40 @@
+/* Active controls have no white rim; the same color field continues past the glass. */
+.topbar .toolbar .filter-active[data-filter-aura]:is(label, .glass-control),
+.topbar .toolbar .filter-active[data-filter-aura] > .glass-control:is(button, select) { background: transparent; border-color: transparent; box-shadow: none; }
+.topbar .toolbar .filter-active.glass-control::before,
+.topbar .toolbar .filter-active.glass-control::after,
+.topbar .toolbar .filter-active > .glass-control::before,
+.topbar .toolbar .filter-active > .glass-control::after { display: none; }
+
+/* A static tint rests on the clear glass; only the retained particles move. */
+.toolbar-filter, .shuffle-control { position: relative; display: inline-flex; flex: 0 0 auto; height: 36px; border-radius: var(--radius, 12px); isolation: isolate; }
+.toolbar .filter-active { position: relative; overflow: visible; isolation: isolate; }
+.toolbar .filter-active > .filter-aura { position: absolute; z-index: 0; inset: 0; border-radius: inherit; }
+.toolbar .filter-active .filter-aura :is(.filter-gradient, .filter-particles, .category-particle) { position: absolute; }
+.toolbar .filter-active .filter-gradient {
+  z-index: 0; inset: -10px -12px; border-radius: 0; filter: blur(5px);
+  background:
+    radial-gradient(ellipse 37% 56% at var(--fog-a, 19% 43%), hsl(calc(var(--aura-hue) + var(--aura-shift-a)) 58% 84% / .46), transparent 100%),
+    radial-gradient(ellipse 31% 45% at var(--fog-b, 46% 61%), hsl(var(--aura-hue) 60% 87% / .35), transparent 100%),
+    radial-gradient(ellipse 34% 53% at var(--fog-c, 77% 46%), hsl(calc(var(--aura-hue) + var(--aura-shift-c)) 58% 85% / .43), transparent 100%),
+    radial-gradient(ellipse 18% 35% at 36% 29%, hsl(var(--aura-hue) 58% 85% / .13), transparent 100%),
+    radial-gradient(ellipse 22% 32% at 64% 72%, hsl(calc(var(--aura-hue) + var(--aura-shift-c)) 58% 85% / .12), transparent 100%);
+  mask-image: linear-gradient(90deg, transparent, black 13%, black 84%, transparent), linear-gradient(180deg, transparent, black 22%, black 76%, transparent);
+  mask-size: 100% 100%; mask-repeat: no-repeat; mask-composite: intersect;
+}
+[data-filter-aura="duration"] { --fog-a: 17% 58%; --fog-b: 51% 38%; --fog-c: 80% 59%; }
+[data-filter-aura="shuffle"] { --fog-a: 15% 46%; --fog-b: 43% 64%; --fog-c: 75% 39%; }
+.toolbar .filter-active .filter-particles { z-index: 1; inset: -8px; overflow: visible; pointer-events: none; }
+.toolbar .filter-active .filter-particles .category-particle { top: calc(var(--particle-y) * 1.4 - 20%); --particle-travel: 28px; }
+.toolbar .filter-active .category-particle { z-index: 1; }
+.toolbar .filter-active .category-particle[data-depth="front"] { z-index: 3; }
+.toolbar .filter-active > :is(input, svg, button, select) { position: relative; z-index: 4; }
+.shuffle-active { gap: 0; }
+.toolbar .shuffle-active > button { border-radius: 0; width: 36px; min-width: 36px; padding: 0; }
+.toolbar .shuffle-active > button:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+.toolbar .shuffle-active > button:nth-child(2) { border-radius: 0 var(--radius) var(--radius) 0; border-left: 1px solid rgb(80 110 135 / .18); }
+@media (forced-colors: active) { .toolbar .filter-active > .category-aura { display: none; } .toolbar .shuffle-active > button { border: 1px solid ButtonText; } }
+
 /* Project skin for the MIT dpawlikowski/liquid-glass core.
  * Load vendor/liquid-glass/liquid-glass.css first. Use --simple on all
  * routine controls: no SVG displacement, scene copies, or running animation.
@@ -67,6 +104,80 @@ button.liquid-glass.glass-control:not(:disabled):active {
 }
 
 button.liquid-glass.glass-control:disabled { opacity: .42; cursor: default; }
+.scroll-controls {
+  position: fixed;
+  right: 32px;
+  bottom: 22px;
+  z-index: 7;
+  display: grid;
+  gap: 8px;
+}
+.scroll-controls button.liquid-glass.glass-control {
+  --lg-radius: var(--radius-toolbar-control);
+  --lg-blur: 3px;
+  --lg-saturate: 135%;
+  --lg-border-opacity: .48;
+  --lg-shadow: 0 2px 8px rgb(30 47 62 / .17);
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  overflow: visible;
+  filter: none;
+}
+.scroll-controls .glass-control::before,
+.scroll-controls .glass-control::after { display: none; }
+.scroll-controls button.liquid-glass.glass-control:not(:disabled):active {
+  transform: none;
+}
+.scroll-controls button.liquid-glass.glass-control:disabled { opacity: 1; }
+.scroll-controls .ui-icon {
+  width: 20px;
+  height: 20px;
+}
+.scroll-controls button:disabled .ui-icon { opacity: .42; }
+@media (prefers-reduced-transparency: no-preference) and (forced-colors: none) {
+  .scroll-controls button.liquid-glass.glass-control,
+  .scroll-controls button.liquid-glass.glass-control:not(:disabled):hover {
+    --scroll-glass-highlight: .32;
+    --scroll-glass-base: .09;
+    --scroll-glass-fill: linear-gradient(155deg, rgb(255 255 255 / var(--scroll-glass-highlight)), rgb(255 255 255 / var(--scroll-glass-base)) 70%);
+    background: var(--scroll-glass-fill);
+    box-shadow: var(--lg-shadow);
+  }
+  .scroll-controls button.liquid-glass.glass-control:not(:disabled):hover {
+    --scroll-glass-highlight: .40;
+    --scroll-glass-base: .14;
+  }
+  .scroll-controls button.liquid-glass.glass-control:focus-visible {
+    box-shadow: var(--lg-shadow), 0 0 0 4px rgb(132 181 213 / .10);
+  }
+  @supports (backdrop-filter: url(#scroll-icon-tone)) and (mask: none) {
+    .scroll-controls button.liquid-glass.glass-control,
+    .scroll-controls button.liquid-glass.glass-control:not(:disabled):hover {
+      background: transparent;
+      backdrop-filter: none;
+    }
+    /* Keep the glass blur separate from the background sample that colors the glyph. */
+    .scroll-controls .glass-control::before {
+      display: block;
+      border-radius: calc(var(--lg-radius) - 1px);
+      background: var(--scroll-glass-fill);
+      backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+    }
+    .scroll-controls .ui-icon { visibility: hidden; }
+    .scroll-controls .glass-control::after {
+      display: block;
+      inset: 9px;
+      border-radius: 0;
+      box-shadow: none;
+      mix-blend-mode: normal;
+      mask: var(--scroll-icon) center / contain no-repeat;
+      backdrop-filter: url(#scroll-icon-tone);
+    }
+    .scroll-controls .glass-control:disabled::after { opacity: .42; }
+  }
+}
+.main .content:has(.grid) { padding-bottom: 108px; }
 .liquid-glass.glass-control:focus-visible {
   outline: 2px solid rgb(65 107 135 / .52);
   outline-offset: 2px;
@@ -93,7 +204,7 @@ button.liquid-glass.glass-control:disabled { opacity: .42; cursor: default; }
 }
 
 button.liquid-glass.glass-tinted:not(:disabled):hover {
-  background: linear-gradient(155deg, rgb(243 255 249 / .44), rgb(57 189 136 / .14));
+  background: linear-gradient(155deg, rgb(243 255 249 / .44), rgb(var(--tinted-color-rgb) / .14));
 }
 
 .glass-search {
@@ -176,8 +287,9 @@ button.liquid-glass.glass-tinted:not(:disabled):hover {
 
 /* One unbroken row; compact actions before allowing horizontal scrolling. */
 .main { container-type: inline-size; }
+.topbar.glass-panel { --radius: var(--radius-toolbar-control); --lg-radius: var(--radius-toolbar); }
 .topbar { grid-template-columns: minmax(0, 1fr); gap: 10px; }
-.topbar .toolbar { display: flex; flex-wrap: nowrap; width: 100%; min-width: 0; justify-content: flex-start; align-items: center; gap: 8px; overflow-x: auto; padding: 4px; scrollbar-width: thin; }
+.topbar .toolbar { display: flex; flex-wrap: nowrap; width: calc(100% + 16px); min-width: 0; justify-content: flex-start; align-items: center; gap: 8px; overflow-x: auto; padding: 14px 8px; margin: -14px -8px; scrollbar-width: thin; }
 .toolbar-find {
   display: flex;
   flex: 0 0 auto;
@@ -196,10 +308,16 @@ button.liquid-glass.glass-tinted:not(:disabled):hover {
 .toolbar-find + .toolbar-divider { margin-left: auto; }
 .toolbar .glass-control svg { position: relative; z-index: 2; width: 18px; height: 18px; flex: 0 0 auto; }
 .toolbar .glass-control span { position: relative; z-index: 2; }
-.toolbar button { font-size: 13px; }
-.toolbar .sync-button { font-weight: 600; }
+.toolbar button, .quick-classify-button { font-size: 13px; }
+.sync-button, .quick-classify-button { font-weight: 600; }
+.quick-classify-button.glass-control {
+  --radius: var(--radius-toolbar-control);
+  flex: none;
+  /* The larger heading's glyphs sit slightly below its line box center. */
+  inset-block-start: 2px;
+}
 .toolbar .batch-button[aria-pressed="true"] { background: linear-gradient(155deg, rgb(221 242 255 / .42), rgb(128 183 217 / .16)); color: #294d68; box-shadow: inset 0 0 0 1px rgb(84 142 177 / .30), inset 0 1px 0 rgb(255 255 255 / .7); }
-.toolbar :is(.shuffle-button, .settings-button, .toolbar-icon-button) { width: 36px; min-width: 36px; padding: 0; }
+.toolbar :is(.shuffle-button, .toolbar-icon-button) { width: 36px; min-width: 36px; padding: 0; }
 .toolbar button.toolbar-icon-button.glass-control { display: grid; place-items: center; }
 .toolbar button.toolbar-icon-button.glass-control svg { display: block; margin: 0; align-self: center; justify-self: center; }
 .toolbar-icon-button[data-action="open-bili-home"] { color: #d34377; }
@@ -214,8 +332,8 @@ button.liquid-glass.glass-tinted:not(:disabled):hover {
   .toolbar-find .glass-search { width: 240px; flex-basis: 240px; }
   .toolbar-find .glass-select { width: 100px; }
   .toolbar-find [data-role="sort-combo"] { width: 116px; }
-  .toolbar-maintenance button { width: 36px; min-width: 36px; padding: 0; }
-  .toolbar-maintenance button span { display: none; }
+  .toolbar-maintenance :is(.sync-button, .batch-button) { width: 36px; min-width: 36px; padding: 0; }
+  .toolbar-maintenance :is(.sync-button, .batch-button) span { display: none; }
   .toolbar-divider { margin-inline: 0; }
   .topbar .toolbar { gap: 6px; }
 }

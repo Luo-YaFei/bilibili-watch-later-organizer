@@ -67,18 +67,23 @@ test("Jev automatic continuation skips uncertain videos already attempted in thi
     classifications.push(core.mergeClassification(null, JSON.parse(payload).items[0], video));
     return { importResult: { imported: 1, skipped: 0 } };
   };
-  const result = await bg.runAutomaticLlmBatches(settings, false);
+  const config = { settings, categories };
+  const result = await bg.runAutomaticLlmBatches(config, bg.automaticAttempts(config));
   assert.equal(calls, 1);
   assert.equal(result.remaining, 0);
   assert.equal(core.needsLlmExport(video, classifications[0]), true);
-  await bg.runAutomaticLlmBatches(settings, true);
+  await bg.runAutomaticLlmBatches(config, bg.automaticAttempts(config, stored.autoLlmAttempts));
   assert.equal(calls, 1);
+  video.title = "更新后的数学课程";
+  await bg.runAutomaticLlmBatches(config, bg.automaticAttempts(config, stored.autoLlmAttempts));
+  assert.equal(calls, 2);
 });
 
 function loadBackgroundHelpers() {
   const source = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   const sandbox = {
     console,
+    URL,
     importScripts() {},
     chrome: {
       runtime: {
@@ -117,6 +122,11 @@ test("bulk multi-category add preserves existing manual assignments and rejects 
   bg.BiliWLDB.getAll = async () => videos;
   bg.BiliWLDB.getClassification = async bvid => saved.get(bvid);
   bg.BiliWLDB.putClassification = async item => { writes++; saved.set(item.bvid, item); };
+  bg.BiliWLDB.updateClassification = async (bvid, update) => {
+    const result = update(saved.get(bvid));
+    if (result === null) saved.delete(bvid);
+    return result;
+  };
   const result = await bg.bulkUpdateClassifications({ action: "add", bvids: videos.map(video => video.bvid), categoryIds: ["study", "music", "study"] });
   assert.equal(result.bulkUpdateResult.updated, 2);
   for (const item of saved.values()) {
@@ -129,22 +139,30 @@ test("bulk multi-category add preserves existing manual assignments and rejects 
   }
   assert.equal(writes, 2);
   await bg.bulkUpdateClassifications({ action: "clear", bvids: [videos[0].bvid] });
-  assert.deepEqual(Array.from(saved.get(videos[0].bvid).categoryIds), []);
+  assert.equal(saved.has(videos[0].bvid), false);
+  assert.equal(core.needsLlmExport(videos[0], saved.get(videos[0].bvid)), true);
 });
 
 test("delete prefers a live Bilibili page without sending a background POST", async () => {
   const bg = loadBackgroundHelpers();
   const calls = [];
-  bg.getBiliCsrf = async () => "token";
-  bg.chrome.tabs.query = async () => [{ id: 3, status: "complete" }];
-  bg.requestWatchlaterRemoveFromPage = async (aid, csrf, bvid, tab) => calls.push([aid, csrf, bvid, tab.id]);
+  bg.getBiliCsrf = async () => assert.fail("page should use its own login");
+  bg.chrome.tabs.query = async (filter) => {
+    assert.deepEqual(Object.keys(filter), []);
+    return [
+      { id: 2, url: "https://www.bilibili.com/", status: "complete", active: true },
+      { id: 3, url: "https://www.bilibili.com/list/watchlater/", status: "complete" },
+      { id: 4, url: "https://www.bilibili.com/watchlater/list/", status: "complete", incognito: true }
+    ];
+  };
+  bg.requestWatchlaterRemoveFromPage = async (aid, bvid, tab) => calls.push([aid, bvid, tab.id]);
   bg.performWatchlaterRemoval = async () => assert.fail("unnecessary background request");
   await bg.requestWatchlaterRemove(123, "BV123");
-  assert.deepEqual(calls, [[123, "token", "BV123", 3]]);
+  assert.deepEqual(calls, [[123, "BV123", 3]]);
 });
 
 test("delete falls back after a page closes and works without any Bilibili tab", async () => {
-  for (const tabs of [[], [{ id: 3, status: "complete" }]]) {
+  for (const tabs of [[], [{ id: 3, url: "https://www.bilibili.com/", status: "complete" }]]) {
     const bg = loadBackgroundHelpers();
     let posts = 0;
     bg.getBiliCsrf = async () => "token";
@@ -158,18 +176,19 @@ test("delete falls back after a page closes and works without any Bilibili tab",
 
 test("delete ignores discarded and frozen tabs even if they are active", async () => {
   const bg = loadBackgroundHelpers();
-  bg.chrome.tabs.query = async () => [
+  const tabs = [
     { id: 1, active: true, status: "complete", discarded: true },
     { id: 2, active: true, status: "complete", frozen: true },
     { id: 3, status: "complete" }
-  ];
-  assert.equal((await bg.findBilibiliTab()).id, 3);
-  bg.chrome.tabs.query = async () => [{ id: 1, discarded: true }];
-  assert.equal(await bg.findBilibiliTab(), null);
+  ].map(tab => ({ ...tab, url: "https://www.bilibili.com/" }));
+  assert.equal(bg.findBilibiliTab(tabs).id, 3);
+  assert.equal(bg.findBilibiliTab(tabs.slice(0, 2)), null);
 });
 
 function preparePageDelete(bg) {
   Object.assign(bg, { setTimeout: (fn, ms) => setTimeout(fn, ms < 2000 ? 0 : ms), clearTimeout, FormData, AbortController });
+  bg.location = { origin: "https://www.bilibili.com" };
+  bg.document = { cookie: "bili_jct=token" };
   bg.chrome.scripting = {
     executeScript: async ({ func, args }) => [{ result: await func(...args) }]
   };
@@ -178,14 +197,11 @@ function preparePageDelete(bg) {
 test("unloaded tabs are excluded even when discarded and frozen are false", async () => {
   const bg = loadBackgroundHelpers();
   const unloaded = [8531, 8543, 8586].map((id) => ({
-    id, status: "unloaded", active: false, discarded: false, frozen: false
+    id, status: "unloaded", active: false, discarded: false, frozen: false, url: "https://www.bilibili.com/"
   }));
-  bg.chrome.tabs.query = async () => unloaded;
-  assert.equal(await bg.findBilibiliTab(), null);
-  bg.chrome.tabs.query = async () => [...unloaded, { id: 9, status: "loading" }];
-  assert.equal((await bg.findBilibiliTab()).id, 9);
-  bg.chrome.tabs.query = async () => [...unloaded, { id: 10, status: "complete" }];
-  assert.equal((await bg.findBilibiliTab()).id, 10);
+  assert.equal(bg.findBilibiliTab(unloaded), null);
+  assert.equal(bg.findBilibiliTab([...unloaded, { id: 9, status: "loading", url: "https://www.bilibili.com/" }]).id, 9);
+  assert.equal(bg.findBilibiliTab([...unloaded, { id: 10, status: "complete", url: "https://www.bilibili.com/" }]).id, 10);
 });
 
 test("delete automatically loads an existing unloaded tab without activating or creating tabs", async () => {
@@ -219,7 +235,7 @@ test("a tab activated by the user during preparation is not reloaded", async () 
   bg.chrome.tabs.get = async () => ({ id: 1, status: "complete", url: "https://www.bilibili.com/" });
   bg.chrome.tabs.reload = async () => assert.fail("must not reload a loaded page");
   bg.chrome.scripting = { executeScript: async () => [{ result: true }] };
-  assert.equal((await bg.loadExistingBilibiliTab()).id, 1);
+  assert.equal((await bg.loadExistingBilibiliTab(await bg.chrome.tabs.query())).id, 1);
 });
 
 test("background loading stops if the tab closes or navigates elsewhere", async () => {
@@ -234,7 +250,7 @@ test("background loading stops if the tab closes or navigates elsewhere", async 
       return { id: 1, status: "unloaded", url: reloaded ? destination : "https://www.bilibili.com/" };
     };
     bg.chrome.scripting = { executeScript: async () => assert.fail("must not inject") };
-    await assert.rejects(bg.loadExistingBilibiliTab(), /No tab|正在跳转/);
+    await assert.rejects(bg.loadExistingBilibiliTab(await bg.chrome.tabs.query()), /No tab|正在跳转/);
   }
 });
 
@@ -246,14 +262,14 @@ test("background page preparation has a deadline even if the readiness probe han
   bg.chrome.tabs.get = async () => ({ id: 1, status: reloaded ? "loading" : "unloaded", url: "https://www.bilibili.com/" });
   bg.chrome.tabs.reload = async () => { reloaded = true; };
   bg.chrome.scripting = { executeScript: () => new Promise(() => {}) };
-  await assert.rejects(bg.loadExistingBilibiliTab(), /后台加载 B站页面超时/);
+  await assert.rejects(bg.loadExistingBilibiliTab(await bg.chrome.tabs.query()), /后台加载 B站页面超时/);
 });
 
 test("no existing page does not create a temporary tab", async () => {
   const bg = loadBackgroundHelpers();
   bg.chrome.tabs.query = async () => [];
   bg.chrome.tabs.create = async () => assert.fail("must not create temporary tabs");
-  assert.equal(await bg.loadExistingBilibiliTab(), null);
+  assert.equal(await bg.loadExistingBilibiliTab([]), null);
 });
 
 test("delete injects immediately into a loading page without waiting for tab completion", async () => {
@@ -269,7 +285,7 @@ test("delete injects immediately into a loading page without waiting for tab com
       return [{ result: { verified: true, bvid: "BV1Yz411B7n3" } }];
     }
   };
-  const result = await bg.requestWatchlaterRemoveFromPage(123, "token", "BV1Yz411B7n3", { id: 3, status: "loading" });
+  const result = await bg.requestWatchlaterRemoveFromPage(123, "BV1Yz411B7n3", { id: 3, status: "loading" });
   assert.equal(result.verified, true);
 });
 
@@ -289,7 +305,7 @@ test("injected delete uses current official resources API and preserves business
     assert.ok(options.signal);
     return { ok: true, json: async () => ({ code: -111, message: "csrf校验失败" }) };
   };
-  await assert.rejects(bg.requestWatchlaterRemoveFromPage(123, "token", deleteTarget.bvid, { id: 3 }), /登录凭据已变化.*code -111/);
+  await assert.rejects(bg.requestWatchlaterRemoveFromPage(123, deleteTarget.bvid, { id: 3 }), /登录凭据已变化.*code -111/);
 });
 
 test("an unresponsive injected page releases the deletion queue after timeout", async () => {
@@ -297,7 +313,7 @@ test("an unresponsive injected page releases the deletion queue after timeout", 
   preparePageDelete(bg);
   bg.setTimeout = (fn) => setTimeout(fn, 5);
   bg.chrome.scripting.executeScript = () => new Promise(() => {});
-  const failed = bg.runWatchlaterMembershipTask(() => bg.requestWatchlaterRemoveFromPage(123, "token", "BV123", { id: 3 }));
+  const failed = bg.runWatchlaterMembershipTask(() => bg.requestWatchlaterRemoveFromPage(123, "BV123", { id: 3 }));
   const next = bg.runWatchlaterMembershipTask(async () => "next deletion ran");
   await assert.rejects(failed, /页面无响应/);
   assert.equal(await next, "next deletion ran");
@@ -306,10 +322,51 @@ test("an unresponsive injected page releases the deletion queue after timeout", 
 test("delete retains both failure reasons and never reports success", async () => {
   const bg = loadBackgroundHelpers();
   bg.getBiliCsrf = async () => "token";
-  bg.chrome.tabs.query = async () => [{ id: 3 }];
-  bg.requestWatchlaterRemoveFromPage = async () => { throw new Error("页面 HTTP 412"); };
+  bg.chrome.tabs.query = async () => [{ id: 3, url: "https://www.bilibili.com/" }];
+  bg.requestWatchlaterRemoveFromPage = async () => { throw new Error("脚本注入失败"); };
   bg.performWatchlaterRemoval = async () => ({ error: "后台 HTTP 403", retryable: true });
-  await assert.rejects(bg.requestWatchlaterRemove(123, "BV123"), /页面 HTTP 412.*后台 HTTP 403/);
+  await assert.rejects(bg.requestWatchlaterRemove(123, "BV123"), /脚本注入失败.*扩展后台.*HTTP 403/);
+});
+
+test("delete tries a second live Bilibili page when the preferred tab closes before injection", async () => {
+  const bg = loadBackgroundHelpers();
+  const tabs = [
+    { id: 2, url: "https://www.bilibili.com/", status: "complete" },
+    { id: 3, url: "https://www.bilibili.com/watchlater/list", status: "complete" }
+  ];
+  const attempted = [];
+  bg.chrome.tabs.query = async () => tabs;
+  bg.requestWatchlaterRemoveFromPage = async (_aid, _bvid, tab) => {
+    attempted.push(tab.id);
+    if (tab.id === 3) throw new Error("标签页已关闭");
+    return { verified: true };
+  };
+  bg.getBiliCsrf = async () => assert.fail("do not fall back to the worker");
+  assert.equal((await bg.requestWatchlaterRemove(123, deleteTarget.bvid)).verified, true);
+  assert.deepEqual(attempted, [3, 2]);
+});
+
+test("an HTTP 412 from the delete POST stops both list verification and context fallback", async () => {
+  for (const pageAvailable of [true, false]) {
+    const bg = loadBackgroundHelpers();
+    preparePageDelete(bg);
+    bg.chrome.tabs.query = async () => pageAvailable ? [{ id: 3, url: "https://www.bilibili.com/", status: "complete" }] : [];
+    bg.getBiliCsrf = async () => {
+      assert.equal(pageAvailable, false, "do not fall back to a worker after the page POST");
+      return "token";
+    };
+    const requests = [];
+    bg.fetch = async (_url, options) => {
+      requests.push(options.method || "GET");
+      return options.method === "POST" ? { ok: false, status: 412 } : listResponse([deleteTarget]);
+    };
+    await assert.rejects(bg.requestWatchlaterRemove(123, deleteTarget.bvid), error => {
+      assert.match(error.message, /移出稍后再看失败：HTTP 412/);
+      assert.doesNotMatch(error.message, /核实删除结果失败/);
+      return true;
+    });
+    assert.deepEqual(requests, ["GET", "POST"]);
+  }
 });
 
 test("code zero with the video still on the server is not a successful deletion", async () => {
@@ -427,10 +484,135 @@ test("failed server verification never marks local membership removed", async ()
   await assert.rejects(bg.removeFromWatchlaterUnlocked({ bvid: deleteTarget.bvid }), /未能核实/);
 });
 
+test("only a complete API list can mark videos removed, while DOM fallback still adds visible videos", async () => {
+  const bg = loadBackgroundHelpers();
+  bg.AbortSignal = AbortSignal;
+  bg.getConfig = async () => ({ settings: {} });
+  bg.getState = async () => ({});
+  const upserts = [], removals = [];
+  bg.BiliWLDB.get = async () => undefined;
+  bg.BiliWLDB.put = async () => {};
+  bg.BiliWLDB.upsertVideos = async (items, options) => {
+    upserts.push(options.authoritativeWatchlater);
+    return { results: items.map(video => ({ video })) };
+  };
+  bg.BiliWLDB.markRemovedExcept = async (bvids, aids) => {
+    removals.push([Array.from(bvids), Array.from(aids)]);
+    return [];
+  };
+  for (const data of [null, { count: 2, list: [] }, { count: 1, list: [null] },
+    { count: 2, list: [deleteTarget, { ...deleteTarget, aid: 124 }] }]) {
+    bg.fetch = async () => ({ ok: true, json: async () => ({ code: 0, data }) });
+    const result = await bg.scanWatchlater({ domItems: [deleteTarget], skipAutoClassify: true });
+    assert.ok(result.apiError);
+    assert.equal(result.scanResult.scannedCount, 1);
+  }
+  assert.deepEqual(removals, []);
+  assert.deepEqual(upserts, [false, false, false, false]);
+
+  bg.fetch = async () => listResponse([deleteTarget, { aid: 456, title: "失效视频" }]);
+  assert.equal((await bg.scanWatchlater({ skipAutoClassify: true })).apiError, "");
+  assert.deepEqual(removals, [[[deleteTarget.bvid], [456]]]);
+  bg.fetch = async () => ({ ok: true, json: async () => ({ code: 0, data: { count: 0, list: null } }) });
+  await bg.scanWatchlater({ skipAutoClassify: true });
+  assert.deepEqual(removals[1], [[], []]);
+});
+
+test("automatic classification sees manual confirmation saved after its initial read", async () => {
+  const bg = loadBackgroundHelpers();
+  const video = { ...deleteTarget, title: "测试视频" };
+  const manual = { bvid: video.bvid, sourceType: "manual", manualOverride: true, categoryIds: ["study"] };
+  bg.getConfig = async () => ({ categories: core.DEFAULT_CATEGORIES });
+  bg.getState = async () => ({});
+  bg.BiliWLDB.summary = async () => ({ videos: [video], classifications: [] });
+  bg.BiliWLDB.get = async () => video;
+  const checked = [];
+  bg.BiliWLDB.updateClassification = async (bvid, updater) => {
+    assert.equal(bvid, video.bvid);
+    const next = updater(manual);
+    assert.equal(next, undefined);
+    checked.push(bvid);
+    return next;
+  };
+  const initial = await bg.autoClassify({ silent: true, unclassifiedOnly: true });
+  assert.equal(initial.autoClassifyResult.classified, 0);
+  const imported = await bg.importClassifications(JSON.stringify([{
+    bvid: video.bvid, categoryIds: ["other.todo"]
+  }]), { mergeMode: "replace" });
+  assert.equal(imported.importResult.skipped, 1);
+  assert.equal(checked.length, 2);
+});
+
+test("only an authoritative sync restores removed membership, including older stored records", () => {
+  const legacy = { ...deleteTarget, presentInWatchlater: false };
+  const seen = { ...deleteTarget, presentInWatchlater: true };
+  const dom = core.canonicalizeVideo(seen, legacy);
+  assert.equal(dom.presentInWatchlater, false);
+  const synced = core.canonicalizeVideo(seen, dom, { authoritativeWatchlater: true });
+  assert.equal(synced.presentInWatchlater, true);
+  assert.equal(synced.watchlaterMembershipRevision, 1);
+  core.setAuthoritativeWatchlaterMembership(synced, false);
+  const details = core.canonicalizeVideo({ bvid: seen.bvid, desc: "更新了简介" }, synced);
+  assert.equal(details.presentInWatchlater, false);
+  assert.equal(details.watchlaterMembershipRevision, 2);
+});
+
+test("simultaneous scans share one request and light scans respect the cooldown", async () => {
+  const bg = loadBackgroundHelpers();
+  let syncMeta, calls = 0;
+  bg.AbortSignal = AbortSignal;
+  bg.getConfig = async () => ({ settings: {} });
+  bg.getState = async () => ({ videos: [deleteTarget] });
+  bg.BiliWLDB.get = async () => syncMeta;
+  bg.BiliWLDB.put = async (_, value) => { syncMeta = value; };
+  bg.BiliWLDB.upsertVideos = async items => ({ results: items.map(video => ({ video })) });
+  bg.BiliWLDB.markRemovedExcept = async () => [];
+  bg.fetch = async (url) => {
+    calls++;
+    assert.equal(url, "https://api.bilibili.com/x/v2/history/toview");
+    return listResponse([deleteTarget]);
+  };
+  const full = () => bg.scanWatchlater({ skipAutoClassify: true });
+  const light = () => bg.scanWatchlater({ skipAutoClassify: true, lightSync: true, domItems: [deleteTarget] });
+  await Promise.all([full(), light(), full()]);
+  assert.equal(calls, 1);
+  await light();
+  assert.equal(calls, 1);
+  bg.fetch = async () => {
+    calls++;
+    return { ok: false, status: 429, headers: { get: () => "120" } };
+  };
+  await full();
+  assert.ok(syncMeta.retryAt >= Date.now() + 119000);
+  assert.match((await full()).apiError, /限流/);
+  assert.equal(calls, 2);
+});
+
+test("numeric inputs distinguish empty values from zero and export honors the manual limit", () => {
+  const bg = loadBackgroundHelpers();
+  assert.equal(core.finiteNumberOrNull("  "), null);
+  assert.equal(core.finiteNumberOrNull(null), null);
+  assert.equal(core.finiteNumberOrNull("0"), 0);
+  assert.equal(bg.exportLimit(undefined, 80, 800), 80);
+  assert.equal(bg.exportLimit(0, 80, 800), 800);
+  assert.equal(bg.exportLimit(450, 80, 800), 450);
+  assert.equal(bg.exportLimit(501, 80, 800), 500);
+  assert.equal(bg.convertBiliApiVideo({ ...deleteTarget, progress: null }, 0).watchProgress, undefined);
+});
+
+test("AI JSON accepts arrays and repairs delimiters without modifying string contents", () => {
+  const reason = "it's a valid string, with a: colon and ,} and brackets [x]";
+  const strict = JSON.stringify([{ bvid: deleteTarget.bvid, reason }]);
+  assert.equal(core.normalizeLlmPayload(core.parseAiJson(strict)).items[0].reason, reason);
+  const loose = "结果如下\n[{bvid: '" + deleteTarget.bvid + "', reason: " + JSON.stringify(reason) + ",},]\n结束";
+  assert.equal(core.parseClassificationPayload(loose).items[0].reason, reason);
+  assert.throws(() => core.parseAiJson("[{bvid: 'unfinished"), /不完整/);
+});
+
 test("business or verification errors do not trigger a second deletion context", async () => {
   const bg = loadBackgroundHelpers();
   bg.getBiliCsrf = async () => "token";
-  bg.chrome.tabs.query = async () => [{ id: 3 }];
+  bg.chrome.tabs.query = async () => [{ id: 3, url: "https://www.bilibili.com/" }];
   bg.requestWatchlaterRemoveFromPage = async () => { throw Object.assign(new Error("视频仍在列表中"), { retryable: false }); };
   bg.performWatchlaterRemoval = async () => assert.fail("must not resend");
   await assert.rejects(bg.requestWatchlaterRemove(123, deleteTarget.bvid), /视频仍在列表中/);
@@ -440,7 +622,7 @@ test("extension version is consistent across manifests", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
-  assert.equal(core.EXTENSION_VERSION, "1.3.0");
+  assert.equal(core.EXTENSION_VERSION, "1.4.0");
   assert.equal(manifest.version, core.EXTENSION_VERSION);
   assert.equal(pkg.version, core.EXTENSION_VERSION);
   assert.match(readme, new RegExp("当前版本：" + core.EXTENSION_VERSION.replaceAll(".", "\\.")));
@@ -733,7 +915,7 @@ test("matchesFilter handles unclassified and category filters", () => {
   assert.equal(core.matchesFilter(video, { categoryIds: ["tech.ai.llm"] }, { categoryIds: ["life.food"] }), false);
 });
 
-test("matchesFilter supports duration thresholds and partially played videos", () => {
+test("matchesFilter supports duration thresholds and includes finished videos in the playback filter", () => {
   const short = { bvid: "BV1aa411c7mA", presentInWatchlater: true, duration: 120, watchProgress: 0 };
   const medium = { bvid: "BV1bb411c7mB", presentInWatchlater: true, duration: 301, watchProgress: 125, isWatched: false };
   const long = { bvid: "BV1cc411c7mC", presentInWatchlater: true, duration: 3600, watchProgress: 3600, isWatched: true };
@@ -741,8 +923,13 @@ test("matchesFilter supports duration thresholds and partially played videos", (
   assert.equal(core.matchesFilter(medium, null, { videoFilter: "duration-300" }), false);
   assert.equal(core.matchesFilter(medium, null, { videoFilter: "duration-600" }), true);
   assert.equal(core.matchesFilter(long, null, { videoFilter: "duration-3600-plus" }), true);
-  assert.equal(core.matchesFilter(medium, null, { videoFilter: "partially-played" }), true);
-  assert.equal(core.matchesFilter(long, null, { videoFilter: "partially-played" }), false);
+  const playbackFilter = { videoFilter: "partially-played" };
+  assert.equal(core.matchesFilter(medium, null, playbackFilter), true);
+  assert.equal(core.matchesFilter(long, null, playbackFilter), true);
+  assert.equal(core.matchesFilter({ watchProgress: 0, isWatched: true }, null, playbackFilter), true);
+  assert.equal(core.matchesFilter({ duration: 300, watchProgress: 300 }, null, playbackFilter), true);
+  assert.equal(core.matchesFilter(short, null, playbackFilter), false);
+  assert.equal(core.matchesFilter({ duration: 300 }, null, playbackFilter), false);
 });
 
 test("detail-only canonicalization preserves removed watchlater membership", () => {
@@ -950,7 +1137,7 @@ test("background scan only fills unclassified videos and does not auto queue det
   assert.match(scanSource, /const trustedItems = apiSucceeded \? apiItems : domItems/);
   assert.match(scanSource, /trustedItems\.forEach/);
   assert.equal(scanSource.includes("[...apiItems, ...domItems]"), false);
-  assert.equal(scanSource.includes("queueMissingVideoDetails("), false);
+  assert.match(scanSource, /initialLibraryStarted \? await queueMissingVideoDetails\(\)/);
   assert.equal(upsertSource.includes("queueJobs("), false);
   assert.match(source, /FETCH_VIDEO_DETAILS:[\s\S]*?queueMissingVideoDetails\(\)/);
 });
@@ -967,7 +1154,7 @@ test("dashboard consolidates AI classification, category generation and API sett
   assert.match(dashboard, /使用 API 生成/);
   assert.match(dashboard, /手动复制 Prompt/);
   assert.match(dashboard, /测试 API/);
-  assert.match(dashboard, /textContent: "设置API"/);
+  assert.match(dashboard, /textContent: "配置视频分类 API"/);
   assert.match(dashboard, /select-settings-page/);
   assert.match(dashboard, /select-settings-tab/);
   assert.match(dashboard, /自动分类条件/);
@@ -987,10 +1174,10 @@ test("dashboard renders watch progress and removes category drag sorting", () =>
   assert.match(dashboard, /watch-progress-value/);
   assert.match(dashboard, /formatDuration\(watchProgress\) \+ "\/" \+ formatDuration\(duration\)/);
   assert.match(dashboard, /category-tree-group/);
-  assert.doesNotMatch(dashboard, /categoryDropTargetGroup|category-drag-handle|draggable: true|onDragStart|REORDER_CATEGORY/);
+  assert.doesNotMatch(dashboard, /categoryDropTargetGroup|category-drag-handle|onDragStart|REORDER_CATEGORY/);
   assert.doesNotMatch(background, /reorderCategory|REORDER_CATEGORY/);
   assert.equal(core.MESSAGE_TYPES.REORDER_CATEGORY, undefined);
-  assert.doesNotMatch(css, /drop-before|cursor: grab/);
+  assert.doesNotMatch(dashboard.slice(dashboard.indexOf("  function renderCategoryTree()"), dashboard.indexOf("  function renderCategoryAdmin()")), /draggable: true|directory-move-handle/);
   assert.match(css, /\.watch-progress-value/);
 });
 
@@ -1017,7 +1204,7 @@ test("watchlater removal wiring is exposed in manifest background dashboard and 
   assert.equal(manifest.permissions.includes("tabs"), true);
   assert.equal(manifest.permissions.includes("scripting"), true);
   assert.equal(core.MESSAGE_TYPES.REMOVE_FROM_WATCHLATER, "REMOVE_FROM_WATCHLATER");
-  assert.match(background, /REMOVE_FROM_WATCHLATER:[\s\S]*?removeFromWatchlater\(message\)/);
+  assert.match(background, /REMOVE_FROM_WATCHLATER:[\s\S]*?removeFromWatchlater\(message, sender\?\.tab\)/);
   assert.match(background, /x\/v2\/history\/toview\/v2\/dels/);
   assert.match(background, /body\.set\("resources", String\(aid\)\)/);
   assert.match(background, /requestWatchlaterRemoveFromPage/);
@@ -1026,25 +1213,24 @@ test("watchlater removal wiring is exposed in manifest background dashboard and 
   assert.match(background, /world: "MAIN"/);
   assert.equal(background.includes("waitForTabComplete"), false);
   const pageFallbackStart = background.indexOf("async function requestWatchlaterRemoveFromPage");
-  const pageFallbackEnd = background.indexOf("async function findBilibiliTab");
+  const pageFallbackEnd = background.indexOf("function findBilibiliTab");
   const pageFallbackSource = background.slice(pageFallbackStart, pageFallbackEnd);
   assert.equal(pageFallbackSource.includes("chrome.tabs.create"), false);
   assert.equal(pageFallbackSource.includes("chrome.tabs.remove"), false);
-  assert.match(background, /runWatchlaterMembershipTask\(\(\) => scanWatchlaterUnlocked\(message\)\)/);
-  assert.match(background, /runWatchlaterMembershipTask\(\(\) => removeFromWatchlaterUnlocked\(message\)\)/);
+  assert.match(background, /runWatchlaterMembershipTask\(\(\) => scanWatchlaterUnlocked\(batch\.message\)\)/);
+  assert.match(background, /runWatchlaterMembershipTask\(\(\) => removeFromWatchlaterUnlocked\(message, sourceTab\)\)/);
   assert.match(content, /card === link \|\| !card\.querySelector \|\| !card\.querySelector\("img"\)/);
   assert.equal(background.includes("csrf_token"), false);
   assert.match(dashboard, /remove-watchlater/);
   assert.match(dashboard, /watchlaterPlaybackUrl/);
   assert.match(dashboard, /className: "cover-link"[\s\S]*?standardVideoUrl\(video\)/);
-  assert.match(dashboard, /batchMode \? renderCover\(video\) : el\("a"/);
+  assert.match(dashboard, /batchMode && link.classList.contains\("cover-link"\)\) event.preventDefault\(\)/);
   assert.match(dashboard, /title: "移出稍后再看"/);
   assert.match(dashboard, /"aria-label": "移出稍后再看"/);
   assert.match(dashboard, /video\.presentInWatchlater = false/);
   assert.match(dashboard, /pendingRemovalBvids\.add\(bvid\)/);
   assert.match(dashboard, /pendingRemovalBvids\.has\(video\.bvid\)/);
-  assert.match(dashboard, /confirmedRemovalBvids\.add\(bvid\)/);
-  assert.match(dashboard, /releaseConfirmedRemovals\(nextState\)/);
+  assert.match(dashboard, /trackedWatchlaterMembership\.set\(bvid/);
   assert.match(dashboard, /已从列表移除，正在向 B站确认/);
   assert.match(dashboard, /移出失败，视频已恢复/);
   assert.equal(dashboard.includes('title: "移出稍后再看？"'), false);
@@ -1068,7 +1254,8 @@ test("manifest exposes blue extension icons and homepage dashboard entry", () =>
   assert.match(iconSvg, /stroke="#ffffff"/);
   assert.equal(iconSvg.includes("Gradient"), false);
   assert.equal(iconSvg.includes("DropShadow"), false);
-  assert.equal(manifest.content_scripts[0].matches.includes("https://www.bilibili.com/*"), true);
+  assert.equal(manifest.content_scripts[0].matches.includes("https://www.bilibili.com/"), true);
+  assert.equal(manifest.content_scripts[0].matches.includes("https://www.bilibili.com/*"), false);
   assert.match(dashboardHtml, /icons\/icon-32\.png/);
   assert.match(content, /HOME_BUTTON_ID/);
   assert.match(content, /isBiliHomePage/);
@@ -1124,10 +1311,9 @@ test("dashboard exposes AI API batch video classification controls", () => {
   assert.match(source, /EXPORT_CLASSIFY_BATCH/);
   assert.match(source, /IMPORT_CLASSIFICATIONS/);
   assert.match(source, /fetchWithTimeout/);
-  assert.match(source, /repairLooseJson/);
   assert.match(source, /chatCompletionsUrl/);
   assert.match(source, /sendLlmRequest/);
-  assert.match(source, /AI 返回的内容不是严格 JSON/);
+  assert.match(source, /core\.parseAiJson/);
 });
 
 test("automatic API classification uses alarms and preserves manual results", () => {
@@ -1172,7 +1358,7 @@ test("fresh install onboarding detects login and exposes three first classificat
   assert.match(dashboard, /手动调整一个视频分类/);
   assert.match(dashboard, /AI \(手动导入\/导出\) 批量视频分类/);
   assert.match(dashboard, /启动 AI \(API\) 批量视频分类/);
-  assert.match(dashboard, /finishClassificationAndSync/);
+  assert.match(dashboard, /finishClassification/);
   assert.match(css, /\.onboarding-overlay/);
   assert.match(css, /\.onboarding-banner/);
   const onboardingOverlayRule = css.match(/\.onboarding-overlay\s*\{[^}]*\}/)?.[0];
@@ -1189,11 +1375,11 @@ test("onboarding category-list updates do not classify videos before step three"
   assert.equal(importSource.includes("autoClassify("), false);
   assert.match(importSource, /appendKeywordCategories\(addedCategoryIds, categories\)/);
   assert.match(dashboard, /confirmAndImportCategories\(payload, "api", "API"\)/);
-  assert.match(dashboard, /confirmAndImportCategories\(parseJsonObject\(payload\), "prompt", "手动 Prompt"\)/);
+  assert.match(dashboard, /confirmAndImportCategories\(core\.parseAiJson\(payload\), "prompt", "手动 Prompt"\)/);
   assert.match(dashboard, /source,\s*skipAutoClassify: onboardingActive\(\)/);
   assert.match(background, /message\.skipAutoClassify[\s\S]*?暂不分类视频/);
   assert.match(dashboard, /SYNC_ON_OPEN, skipAutoClassify: onboardingActive\(\)/);
-  assert.match(dashboard, /syncAfterCategoryListChange/);
+  assert.doesNotMatch(dashboard, /syncAfterCategoryListChange/);
   assert.match(dashboard, /skipAutoClassify: onboardingActive\(\) && onboardingStage\(\) === "setup-categories"/);
   assert.match(dashboard, /分类目录已确定，接下来给视频分类/);
 });
@@ -1216,7 +1402,7 @@ test("manual category directory save applies additions and deletions to every cl
 test("sync keyword classification only fills videos without an existing category", () => {
   const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   assert.match(background, /autoClassify\(\{ silent: true, unclassifiedOnly: true \}\)/);
-  assert.match(background, /unclassifiedOnly && existing && core\.uniqueStrings\(existing\.categoryIds\)\.length/);
+  assert.match(background, /options\.unclassifiedOnly && existing && core\.uniqueStrings\(existing\.categoryIds\)\.length/);
 });
 
 test("LLM batch import refreshes state and reads latest video records", () => {
@@ -1224,5 +1410,5 @@ test("LLM batch import refreshes state and reads latest video records", () => {
   const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   assert.match(dashboard, /updateState\(importedState\)/);
   assert.match(background, /await db\.get\("videos", item\.bvid\)/);
-  assert.match(background, /await db\.getClassification\(item\.bvid\)/);
+  assert.match(background, /await db\.updateClassification\(item\.bvid,/);
 });

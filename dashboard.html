@@ -10,9 +10,25 @@
   <link rel="stylesheet" href="src/liquid-glass.css">
 </head>
 <body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <filter id="scroll-icon-tone" filterUnits="userSpaceOnUse" x="0" y="0" width="20" height="20" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="5" edgeMode="duplicate"/>
+      <feColorMatrix type="saturate" values="0"/>
+      <feComponentTransfer x="9" y="9" width="2" height="2" result="sample">
+        <feFuncR type="discrete" tableValues=".97 .10"/>
+        <feFuncG type="discrete" tableValues=".97 .10"/>
+        <feFuncB type="discrete" tableValues=".97 .10"/>
+      </feComponentTransfer>
+      <feTile in="sample" x="0" y="0" width="20" height="20"/>
+      <!-- Give every point the same tone if the sample straddles a brightness threshold. -->
+      <feMorphology operator="dilate" radius="2"/>
+    </filter>
+  </svg>
   <div id="app"></div>
   <script src="src/shared.js"></script>
   <script src="src/category-aura.js"></script>
+  <script src="src/cover-cache.js"></script>
+  <script src="src/cover-loader.js"></script>
   <script src="src/dashboard.js"></script>
 </body>
 </html>

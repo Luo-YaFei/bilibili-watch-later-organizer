@@ -1,4 +1,4 @@
-importScripts("shared.js", "idb.js");
+importScripts("shared.js", "idb.js", "cover-cache.js", "cover-worker.js");
 
 const core = globalThis.BiliWLCore;
 const db = globalThis.BiliWLDB;
@@ -7,12 +7,26 @@ const ONBOARDING_VERSION = 1;
 const AUTO_LLM_ALARM = "auto-llm-classify";
 const AUTO_LLM_CONTINUE_ALARM = "auto-llm-classify-continue";
 const AUTO_LLM_MAX_BATCHES_PER_WAKE = 2;
+const DETAIL_ALARM = "continue-video-details";
+const COMBINED_DETAILS_BACKOFF = "combined-video-details-backoff";
+const DETAIL_BATCH_SIZE = 4;
+const DETAIL_REQUEST_INTERVAL = 2000;
+const DETAIL_BATCH_INTERVAL = 60000;
+const DETAIL_ERROR_PAUSE = 15 * 60000;
+const INITIAL_DETAIL_BATCH_SIZE = 20;
+const INITIAL_DETAIL_REQUEST_INTERVAL = 1000;
+const UNAVAILABLE_VIDEO_CODES = new Set([-404, 62002, 62004, 62012]);
+const WATCHLATER_SYNC_META = "watchlater-sync";
+const LIGHT_SYNC_INTERVAL = 5 * 60000;
 
 let detailRunPromise = null;
+let detailRerunRequested = false;
 let classificationRepairPromise = null;
+let classificationRepairDone = false;
 let initializationPromise = null;
 let autoLlmRunPromise = null;
 let watchlaterMembershipQueue = Promise.resolve();
+let watchlaterScan = null;
 let progress = {
   status: "idle",
   message: "等待扫描",
@@ -40,7 +54,16 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (!alarm || ![AUTO_LLM_ALARM, AUTO_LLM_CONTINUE_ALARM].includes(alarm.name)) return;
+  if (!alarm) return;
+  if (alarm.name === DETAIL_ALARM) {
+    startDetailQueue();
+    return;
+  }
+  if (alarm.name === globalThis.BiliWLCoverWorker?.alarmName) {
+    globalThis.BiliWLCoverWorker.start();
+    return;
+  }
+  if (![AUTO_LLM_ALARM, AUTO_LLM_CONTINUE_ALARM].includes(alarm.name)) return;
   maybeRunAutoLlmClassification(alarm.name)
     .catch((error) => console.warn("automatic AI classification failed", error));
 });
@@ -59,7 +82,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-async function handleMessage(message) {
+async function handleMessage(message, sender) {
+  if (message.type === "PRIORITIZE_COVERS") {
+    if (sender?.url === chrome.runtime.getURL("dashboard.html")) {
+      globalThis.BiliWLCoverWorker.prioritize(message.keys);
+    }
+    return {};
+  }
   if (initializationPromise) await initializationPromise;
   await ensureConfig();
   await ensureClassificationRepair();
@@ -93,12 +122,12 @@ async function handleMessage(message) {
     case core.MESSAGE_TYPES.BULK_UPDATE_CLASSIFICATIONS:
       return bulkUpdateClassifications(message);
     case core.MESSAGE_TYPES.REMOVE_FROM_WATCHLATER:
-      return removeFromWatchlater(message);
+      return removeFromWatchlater(message, sender?.tab);
     case core.MESSAGE_TYPES.UPDATE_SETTINGS:
       return updateSettings(message.settings || {});
     case core.MESSAGE_TYPES.OPEN_DASHBOARD:
       await openDashboard();
-      return getState();
+      return { opened: true };
     case core.MESSAGE_TYPES.ADD_CATEGORY:
       return addCategory(message);
     case core.MESSAGE_TYPES.UPDATE_CATEGORY:
@@ -118,6 +147,10 @@ async function initializeExtension(details) {
   await ensureClassificationRepair();
   const config = await getConfig();
   await configureAutoLlmAlarm(config.settings, false);
+  if (config.settings.detailFetchEnabled && (await db.pendingJobs("detail")).length) {
+    startDetailQueue();
+  }
+  globalThis.BiliWLCoverWorker?.start();
 }
 
 async function initializeOnboarding(details) {
@@ -160,7 +193,9 @@ async function ensureConfig() {
   if (!data.settings) {
     updates.settings = Object.assign({}, core.DEFAULT_SETTINGS);
   } else {
-    updates.settings = Object.assign({}, core.DEFAULT_SETTINGS, data.settings);
+    if (Object.keys(core.DEFAULT_SETTINGS).some(key => !Object.prototype.hasOwnProperty.call(data.settings, key))) {
+      updates.settings = Object.assign({}, core.DEFAULT_SETTINGS, data.settings);
+    }
   }
   if (!Array.isArray(data.categories) || !data.categories.length) {
     updates.categories = core.DEFAULT_CATEGORIES.map((category) => Object.assign({}, category));
@@ -171,25 +206,26 @@ async function ensureConfig() {
   if (Object.keys(updates).length) {
     await chromeStorageSet(updates);
   }
-}
-
-async function getConfig() {
-  await ensureConfig();
-  const data = await chromeStorageGet(["settings", "categories"]);
   return {
-    settings: Object.assign({}, core.DEFAULT_SETTINGS, data.settings || {}),
-    categories: Array.isArray(data.categories) && data.categories.length
-      ? data.categories
-      : core.DEFAULT_CATEGORIES.map((category) => Object.assign({}, category))
+    settings: updates.settings || data.settings,
+    categories: updates.categories || data.categories
   };
 }
 
+async function getConfig() {
+  return ensureConfig();
+}
+
 async function ensureClassificationRepair() {
+  if (classificationRepairDone) return;
   const data = await chromeStorageGet(["settings"]);
   const settings = Object.assign({}, core.DEFAULT_SETTINGS, data.settings || {});
-  if (settings.classificationRepairVersion === CLASSIFICATION_REPAIR_VERSION) return;
+  if (settings.classificationRepairVersion === CLASSIFICATION_REPAIR_VERSION) {
+    classificationRepairDone = true;
+    return;
+  }
   if (!classificationRepairPromise) {
-    classificationRepairPromise = runClassificationRepair()
+    classificationRepairPromise = runClassificationRepair().then(() => { classificationRepairDone = true; })
       .catch((error) => {
         setProgress({ status: "error", message: "分类修复失败：" + (error && error.message ? error.message : String(error)), running: 0 });
         throw error;
@@ -206,12 +242,17 @@ async function runClassificationRepair() {
   let migrated = 0;
   const classifications = await db.getAll("classifications");
   for (const classification of classifications) {
-    const sourceType = core.classificationSourceType(classification);
-    const manualOverride = sourceType === core.CLASSIFICATION_SOURCE_TYPES.MANUAL;
-    if (classification.sourceType !== sourceType || Boolean(classification.manualOverride) !== manualOverride) {
-      await db.putClassification(Object.assign({}, classification, { sourceType, manualOverride }));
-      migrated += 1;
-    }
+    const originalSource = core.classificationSourceType(classification);
+    if (classification.sourceType === originalSource &&
+        Boolean(classification.manualOverride) === (originalSource === core.CLASSIFICATION_SOURCE_TYPES.MANUAL)) continue;
+    const updated = await db.updateClassification(classification.bvid, (current) => {
+      if (!current) return;
+      const sourceType = core.classificationSourceType(current);
+      const manualOverride = sourceType === core.CLASSIFICATION_SOURCE_TYPES.MANUAL;
+      if (current.sourceType === sourceType && Boolean(current.manualOverride) === manualOverride) return;
+      return { ...current, sourceType, manualOverride };
+    });
+    if (updated) migrated += 1;
   }
   const data = await chromeStorageGet(["settings"]);
   const settings = Object.assign({}, core.DEFAULT_SETTINGS, data.settings || {}, {
@@ -235,29 +276,29 @@ async function updateSettings(nextSettings) {
   if (["asc", "desc"].includes(nextSettings.sortDirection)) {
     settings.sortDirection = nextSettings.sortDirection;
   }
-  if (Number.isFinite(Number(nextSettings.batchSize))) {
-    settings.batchSize = Math.min(100, Math.max(20, Number(nextSettings.batchSize)));
+  const openingCategory = core.normalizeOpeningCategory(nextSettings.defaultOpeningCategory, config.categories);
+  if (openingCategory === nextSettings.defaultOpeningCategory) settings.defaultOpeningCategory = openingCategory;
+  if (core.VIDEO_FILTER_OPTIONS.some(([value]) => value === nextSettings.defaultVideoFilter)) {
+    settings.defaultVideoFilter = nextSettings.defaultVideoFilter;
   }
-  if (Number.isFinite(Number(nextSettings.manualExportLimit))) {
-    settings.manualExportLimit = Math.min(500, Math.max(0, Number(nextSettings.manualExportLimit)));
+  if (typeof nextSettings.shuffleOnOpen === "boolean") settings.shuffleOnOpen = nextSettings.shuffleOnOpen;
+  if (core.finiteNumberOrNull(nextSettings.resultBatchSize) !== null) {
+    settings.resultBatchSize = core.normalizeResultBatchSize(nextSettings.resultBatchSize);
   }
-  if (Number.isFinite(Number(nextSettings.detailConcurrency))) {
-    settings.detailConcurrency = Math.min(6, Math.max(1, Number(nextSettings.detailConcurrency)));
+  if (typeof nextSettings.showCommentLocation === "boolean") {
+    settings.showCommentLocation = nextSettings.showCommentLocation;
   }
-  if (Number.isFinite(Number(nextSettings.llmBatchSize))) {
-    settings.llmBatchSize = Math.min(100, Math.max(1, Number(nextSettings.llmBatchSize)));
+  for (const [key, min, max] of [
+    ["batchSize", 20, 100], ["manualExportLimit", 0, 500], ["detailConcurrency", 1, 6],
+    ["llmBatchSize", 1, 100], ["llmLimit", 0, 10000], ["llmAutoClassifyThreshold", 1, 10000]
+  ]) {
+    const number = core.finiteNumberOrNull(nextSettings[key]);
+    if (number !== null) settings[key] = Math.min(max, Math.max(min, Math.floor(number)));
   }
-  if (Number.isFinite(Number(nextSettings.llmLimit))) {
-    settings.llmLimit = Math.min(10000, Math.max(0, Number(nextSettings.llmLimit)));
-  }
-  if (Number.isFinite(Number(nextSettings.llmTemperature))) {
-    settings.llmTemperature = Math.min(2, Math.max(0, Number(nextSettings.llmTemperature)));
-  }
+  const temperature = core.finiteNumberOrNull(nextSettings.llmTemperature);
+  if (temperature !== null) settings.llmTemperature = Math.min(2, Math.max(0, temperature));
   if (["off", "daily", "weekly", "threshold"].includes(nextSettings.llmAutoClassifyMode)) {
     settings.llmAutoClassifyMode = nextSettings.llmAutoClassifyMode;
-  }
-  if (Number.isFinite(Number(nextSettings.llmAutoClassifyThreshold))) {
-    settings.llmAutoClassifyThreshold = Math.min(10000, Math.max(1, Math.floor(Number(nextSettings.llmAutoClassifyThreshold))));
   }
   if (typeof nextSettings.detailFetchEnabled === "boolean") {
     settings.detailFetchEnabled = nextSettings.detailFetchEnabled;
@@ -280,9 +321,8 @@ async function updateSettings(nextSettings) {
   if (["", "categories", "api", "prompt"].includes(nextSettings.onboardingMethod)) {
     settings.onboardingMethod = nextSettings.onboardingMethod;
   }
-  if (Number.isFinite(Number(nextSettings.onboardingVersion))) {
-    settings.onboardingVersion = Number(nextSettings.onboardingVersion);
-  }
+  const onboardingVersion = core.finiteNumberOrNull(nextSettings.onboardingVersion);
+  if (onboardingVersion !== null) settings.onboardingVersion = onboardingVersion;
   if (["openai", "jev"].includes(nextSettings.classificationProvider)) settings.classificationProvider = nextSettings.classificationProvider;
   ["llmBaseUrl", "llmModel", "llmApiKey", "jevApiKey", "jevModel"].forEach((key) => {
     if (Object.prototype.hasOwnProperty.call(nextSettings, key)) {
@@ -334,24 +374,30 @@ async function runScheduledLlmClassification(triggerName) {
     return { skipped: true, reason: "api-not-configured" };
   }
 
-  const summary = await db.summary();
-  const counts = core.classificationStageCounts(summary.videos, summary.classifications);
-  const threshold = Math.max(1, Number(settings.llmAutoClassifyThreshold) || 50);
-  if (triggerName !== AUTO_LLM_CONTINUE_ALARM && mode === "threshold" && counts.pending < threshold) {
-    await writeAutoLlmStatus({
-      llmAutoClassifyLastStatus: "等待待精细分类达到 " + threshold + " 个；当前 " + counts.pending + " 个"
-    });
-    return { skipped: true, reason: "below-threshold", pending: counts.pending };
+  const saved = await chromeStorageGet(["autoLlmAttempts", "autoLlmRetryAt"]);
+  if (saved.autoLlmRetryAt > Date.now()) {
+    chrome.alarms.create(AUTO_LLM_CONTINUE_ALARM, { when: saved.autoLlmRetryAt });
+    return { skipped: true, reason: "rate-limited" };
   }
-  if (!counts.pending) {
-    await writeAutoLlmStatus({ llmAutoClassifyLastStatus: "没有待精细分类的视频" });
+  const attempts = automaticAttempts(config, saved.autoLlmAttempts);
+  const first = await exportClassifyBatch({ limit: 1, attemptedSources: attempts.sources });
+  const pending = first.totalCandidates;
+  const threshold = Math.max(1, Number(settings.llmAutoClassifyThreshold) || 50);
+  if (triggerName !== AUTO_LLM_CONTINUE_ALARM && mode === "threshold" && pending < threshold) {
+    await writeAutoLlmStatus({
+      llmAutoClassifyLastStatus: "等待可自动分类的视频达到 " + threshold + " 个；当前 " + pending + " 个"
+    });
+    return { skipped: true, reason: "below-threshold", pending };
+  }
+  if (!pending) {
+    await writeAutoLlmStatus({ llmAutoClassifyLastStatus: "没有新增或资料有变化的待精细分类视频" });
     return { skipped: true, reason: "no-pending" };
   }
 
   const startedAt = Date.now();
-  setProgress({ status: "running", message: "正在自动进行 API 视频分类", running: 1, pending: counts.pending, done: 0, failed: 0 });
+  setProgress({ status: "running", message: "正在自动进行 API 视频分类", running: 1, pending, done: 0, failed: 0 });
   try {
-    const result = await runAutomaticLlmBatches(settings, triggerName === AUTO_LLM_CONTINUE_ALARM);
+    const result = await runAutomaticLlmBatches(config, attempts);
     await writeAutoLlmStatus({
       llmAutoClassifyLastRunAt: startedAt,
       llmAutoClassifyLastStatus: "自动分类完成：导入 " + result.imported + " 项，跳过 " + result.skipped + " 项" + (result.remaining ? "；剩余任务稍后继续" : ""),
@@ -360,6 +406,11 @@ async function runScheduledLlmClassification(triggerName) {
     setProgress({ status: "idle", message: "自动 API 视频分类完成：导入 " + result.imported + " 项", running: 0, pending: result.remaining, done: result.imported, failed: 0 });
     return result;
   } catch (error) {
+    if ([429, 529].includes(error.status)) {
+      const when = Math.max(Date.now() + 5 * 60000, error.retryAt || 0);
+      await chromeStorageSet({ autoLlmRetryAt: when });
+      chrome.alarms.create(AUTO_LLM_CONTINUE_ALARM, { when });
+    }
     const errorMessage = error && error.message ? error.message : String(error);
     await writeAutoLlmStatus({
       llmAutoClassifyLastRunAt: startedAt,
@@ -371,16 +422,22 @@ async function runScheduledLlmClassification(triggerName) {
   }
 }
 
-async function runAutomaticLlmBatches(settings, continuing) {
+function automaticAttempts({ settings, categories }, saved) {
+  const signature = core.stableJson([
+    core.CLASSIFIER_VERSION, settings.classificationProvider, settings.llmBaseUrl, settings.llmModel,
+    settings.jevModel, settings.llmTemperature, settings.llmUseResponseFormat, categories
+  ]);
+  return { signature, sources: saved?.signature === signature ? { ...saved.sources } : {} };
+}
+
+async function runAutomaticLlmBatches({ settings }, attempts) {
   const batchSize = Math.min(settings.classificationProvider === "jev" ? 5 : 100, Math.max(1, Number(settings.llmBatchSize) || 50));
-  const saved = continuing ? await chromeStorageGet(["autoLlmAttemptedBvids"]) : {};
-  const excludedBvids = Array.isArray(saved.autoLlmAttemptedBvids) ? saved.autoLlmAttemptedBvids.slice() : [];
   let imported = 0;
   let skipped = 0;
   let batches = 0;
   let remaining = 0;
   while (batches < AUTO_LLM_MAX_BATCHES_PER_WAKE) {
-    const exported = await exportClassifyBatch({ includeAll: false, limit: batchSize, offset: 0, excludedBvids });
+    const exported = await exportClassifyBatch({ includeAll: false, limit: batchSize, attemptedSources: attempts.sources });
     remaining = exported.totalCandidates || 0;
     if (!exported.batchSize) break;
     setProgress({ message: "正在自动分类第 " + (batches + 1) + " 批，共 " + exported.batchSize + " 个视频", pending: remaining, running: 1 });
@@ -392,11 +449,12 @@ async function runAutomaticLlmBatches(settings, continuing) {
     imported += importResult.imported || 0;
     skipped += importResult.skipped || 0;
     batches += 1;
-    excludedBvids.push(...exported.batchVideos.map((video) => video.bvid));
-    await chromeStorageSet({ autoLlmAttemptedBvids: excludedBvids });
-    if (!(importResult.imported || 0)) break;
+    for (const video of exported.batchVideos) {
+      attempts.sources[video.bvid] = video.sourceHash || core.computeSourceHash(video);
+    }
+    await chromeStorageSet({ autoLlmAttempts: attempts });
   }
-  const next = await exportClassifyBatch({ includeAll: false, limit: 1, excludedBvids });
+  const next = await exportClassifyBatch({ includeAll: false, limit: 1, attemptedSources: attempts.sources });
   remaining = next.totalCandidates || 0;
   if (remaining > 0 && batches >= AUTO_LLM_MAX_BATCHES_PER_WAKE) {
     chrome.alarms.create(AUTO_LLM_CONTINUE_ALARM, { delayInMinutes: 1 });
@@ -413,24 +471,17 @@ async function callAutomaticLlm(config, prompt) {
   ].join("\n");
   let response = await sendAutomaticLlmRequest(config, requestPrompt, config.llmUseResponseFormat === true);
   let textValue = await response.text();
-  if (!response.ok && config.llmUseResponseFormat === true && /response[_ ]format|json_object/i.test(textValue)) {
+  if (!response.ok && [400, 422].includes(response.status) && config.llmUseResponseFormat === true && /response[_ ]format|json_object/i.test(textValue)) {
     response = await sendAutomaticLlmRequest(config, requestPrompt, false);
     textValue = await response.text();
   }
-  if (!response.ok) throw new Error("AI API HTTP " + response.status + ": " + textValue.slice(0, 300));
-  const data = parseAutomaticJson(textValue);
+  if (!response.ok) throw core.classificationApiError(response, "AI API HTTP " + response.status + ": " + textValue.slice(0, 300));
+  const data = core.parseAiJson(textValue);
   const content = data && data.choices && data.choices[0] && data.choices[0].message
     ? data.choices[0].message.content
     : "";
   if (!content) throw new Error("AI 响应缺少 choices[0].message.content");
-  const parsed = parseAutomaticJson(content);
-  const items = Array.isArray(parsed && parsed.items)
-    ? parsed.items
-    : Array.isArray(parsed && parsed.classifications)
-      ? parsed.classifications
-      : [];
-  if (!items.length) throw new Error("AI 返回的 JSON 没有 items/classifications 数组");
-  return { items };
+  return core.normalizeLlmPayload(core.parseAiJson(content));
 }
 
 function sendAutomaticLlmRequest(config, requestPrompt, useResponseFormat) {
@@ -452,30 +503,6 @@ function sendAutomaticLlmRequest(config, requestPrompt, useResponseFormat) {
     },
     body: JSON.stringify(body)
   }, 120000);
-}
-
-function parseAutomaticJson(value) {
-  const raw = String(value || "").trim();
-  if (!raw) throw new Error("JSON 内容为空");
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const unfenced = fenced ? fenced[1].trim() : raw;
-  const start = unfenced.indexOf("{");
-  const end = unfenced.lastIndexOf("}");
-  const candidate = start >= 0 && end > start ? unfenced.slice(start, end + 1) : unfenced;
-  try {
-    return JSON.parse(candidate);
-  } catch (error) {
-    const repaired = candidate
-      .replace(/^\uFEFF/, "")
-      .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)/g, "$1\"$2\"$3")
-      .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, content) => JSON.stringify(content.replace(/\\"/g, "\"")))
-      .replace(/,\s*([}\]])/g, "$1");
-    try {
-      return JSON.parse(repaired);
-    } catch (repairError) {
-      throw new Error("AI 返回的内容不是严格 JSON：" + repairError.message);
-    }
-  }
 }
 
 function apiConfigReady(settings) {
@@ -519,55 +546,78 @@ async function checkBiliLogin() {
 }
 
 async function syncOnOpen(message) {
-  const scanState = await scanWatchlater({ skipAutoClassify: Boolean(message && message.skipAutoClassify) });
+  const scanState = await scanWatchlater({
+    skipAutoClassify: Boolean(message && message.skipAutoClassify),
+    initializeLibrary: true
+  });
   const scanResult = scanState.scanResult || {};
   const autoResult = scanState.autoClassifyResult || {};
-  setProgress({
-    status: "idle",
-    message: "打开时同步完成：扫描 " + (scanResult.scannedCount || 0) + " 个" + (autoResult.skipped ? "，首次引导暂不分类视频" : "，完成初步分类 " + (autoResult.classified || 0) + " 个"),
-    running: 0,
-    pending: 0,
-    updatedAt: Date.now()
-  });
-  return Object.assign(await getState(), {
+  return Object.assign({}, scanState, { progress,
     openSyncResult: {
       scanResult,
       autoClassifyResult: autoResult,
       apiError: scanState.apiError || "",
       apiCode: scanState.apiCode == null ? null : scanState.apiCode,
-      loginStatus: scanState.loginStatus || "unknown"
+      loginStatus: scanState.loginStatus || "unknown",
+      initialLibraryStarted: scanState.initialLibraryStarted
     }
   });
 }
 
 async function getState() {
-  const config = await getConfig();
-  const summary = await db.summary();
+  const [config, summary] = await Promise.all([getConfig(), db.summary({ includeJobs: false })]);
   return Object.assign({}, summary, config, {
     progress,
     classifySummary: getClassifySummary(summary.videos, summary.classifications)
   });
 }
 
-async function scanWatchlater(message) {
-  return runWatchlaterMembershipTask(() => scanWatchlaterUnlocked(message));
+function scanWatchlater(message) {
+  if (watchlaterScan) {
+    const pending = watchlaterScan.message;
+    pending.domItems.push(...(message.domItems || []));
+    pending.initializeLibrary ||= Boolean(message.initializeLibrary);
+    pending.skipAutoClassify &&= Boolean(message.skipAutoClassify);
+    pending.lightSync &&= Boolean(message.lightSync);
+    return watchlaterScan.promise;
+  }
+  const batch = { message: { ...message, domItems: [...(message.domItems || [])] } };
+  batch.promise = runWatchlaterMembershipTask(() => scanWatchlaterUnlocked(batch.message)).finally(() => {
+    if (watchlaterScan === batch) watchlaterScan = null;
+  });
+  watchlaterScan = batch;
+  return batch.promise;
 }
 
 async function scanWatchlaterUnlocked(message) {
+  const syncMeta = await db.get("meta", WATCHLATER_SYNC_META);
+  if (message.lightSync && Date.now() - (syncMeta?.syncedAt || 0) < LIGHT_SYNC_INTERVAL) {
+    const state = await getState();
+    const known = new Set(state.videos.map(video => video.bvid));
+    if (message.lightSync && message.domItems.every(item => known.has(core.normalizeBvid(item?.bvid || item?.pageUrl)))) {
+      return state;
+    }
+  }
   setProgress({ status: "running", message: "正在扫描稍后再看列表", running: 1 });
   let apiItems = [];
   let apiError = "";
   let apiCode = null;
   let apiSucceeded = false;
+  let unidentifiedAids = [];
   let loginStatus = "unknown";
   try {
-    apiItems = await fetchWatchlaterFromApi();
+    if (syncMeta?.retryAt > Date.now()) throw new Error("B站正在限流，请稍后再同步");
+    ({ items: apiItems, unidentifiedAids } = await fetchWatchlaterFromApi());
     apiSucceeded = true;
     loginStatus = "logged_in";
   } catch (error) {
     apiError = error && error.message ? error.message : String(error);
     apiCode = error && Number.isFinite(Number(error.biliCode)) ? Number(error.biliCode) : null;
     if (apiCode === -101) loginStatus = "logged_out";
+    if (error.status === 429) {
+      await db.put("meta", { key: WATCHLATER_SYNC_META, syncedAt: syncMeta?.syncedAt,
+        retryAt: Math.max(Date.now() + 60000, error.retryAt || 0) });
+    }
   }
 
   const domItems = Array.isArray(message.domItems) ? message.domItems : [];
@@ -580,8 +630,15 @@ async function scanWatchlaterUnlocked(message) {
   });
 
   const markRemoved = apiSucceeded;
-  const upsertResult = await upsertVideoItems(Array.from(itemsByBvid.values()), { markRemoved, skipState: true });
+  const upsertResult = await upsertVideoItems(Array.from(itemsByBvid.values()), { markRemoved, unidentifiedAids, skipState: true });
+  if (apiSucceeded) await db.put("meta", { key: WATCHLATER_SYNC_META, syncedAt: Date.now() });
   const scanCount = itemsByBvid.size;
+  const initialLibraryStarted = Boolean(message.initializeLibrary && apiSucceeded && scanCount &&
+    !(await db.get("meta", core.INITIAL_LIBRARY_SYNC_KEY)));
+  if (initialLibraryStarted) {
+    await db.put("meta", { key: core.INITIAL_LIBRARY_SYNC_KEY, through: Date.now() });
+  }
+  globalThis.BiliWLCoverWorker?.start();
   const newCount = upsertResult.scanResult ? upsertResult.scanResult.newCount : 0;
   const changedCount = upsertResult.scanResult ? upsertResult.scanResult.changedCount : 0;
   const removedCount = upsertResult.scanResult ? upsertResult.scanResult.removedCount || 0 : 0;
@@ -602,16 +659,18 @@ async function scanWatchlaterUnlocked(message) {
     running: 0,
     updatedAt: Date.now()
   });
+  const detailState = initialLibraryStarted ? await queueMissingVideoDetails() : null;
   return Object.assign({
     source: apiSucceeded ? "api+dom" : "dom",
     apiError,
     apiCode,
-    loginStatus
-  }, upsertResult, autoState);
+    loginStatus,
+    initialLibraryStarted
+  }, upsertResult, autoState, detailState);
 }
 
 async function upsertVideoItems(items, options) {
-  const upsert = await db.upsertVideos(items);
+  const upsert = await db.upsertVideos(items, { authoritativeWatchlater: Boolean(options?.markRemoved) });
   const scanResult = {
     scannedCount: upsert.results.length,
     newCount: upsert.results.filter((result) => result.isNew).length,
@@ -620,8 +679,9 @@ async function upsertVideoItems(items, options) {
     changedBvids: upsert.results.filter((result) => result.sourceChanged).map((result) => result.video.bvid)
   };
   const bvids = upsert.results.map((item) => item.video.bvid);
-  if (options && options.markRemoved) {
-    const removedBvids = await db.markRemovedExcept(bvids);
+  if (options?.markRemoved) {
+    if (upsert.errors?.length) throw new Error("部分视频无法保存，已保留原有稍后再看记录");
+    const removedBvids = await db.markRemovedExcept(bvids, options.unidentifiedAids);
     scanResult.removedCount = removedBvids.length;
     scanResult.removedBvids = removedBvids;
   }
@@ -639,19 +699,22 @@ async function queueMissingVideoDetails() {
     });
   }
 
-  const videos = await db.getAll("videos");
+  const [videos, schedule] = await Promise.all([db.getAll("videos"), db.get("meta", DETAIL_ALARM)]);
   const missingDetailBvids = videos
     .filter((video) => video && video.presentInWatchlater !== false)
     .filter(shouldFetchDetails)
     .map((video) => video.bvid);
   const queued = await db.queueJobs("detail", missingDetailBvids, "manual");
-  const jobs = await db.getAll("jobs");
-  const activeJobs = jobs.filter((job) => job.type === "detail" && (job.status === "pending" || job.status === "running"));
+  const activeJobs = await db.pendingJobs("detail");
 
-  if (activeJobs.length) {
-    setProgress({ status: "running", message: "已排队 " + activeJobs.length + " 个视频详情", pending: activeJobs.length, running: 0, done: 0, failed: 0 });
+  const pausedUntil = schedule?.error && schedule.resumeAt > Date.now() ? schedule.resumeAt : 0;
+  if (activeJobs.length && pausedUntil) {
+    setProgress({ status: "error", message: "详情更新已暂停：" + schedule.error, pending: activeJobs.length, running: 0 });
     startDetailQueue();
-  } else {
+  } else if (activeJobs.length) {
+    if (!detailRunPromise) setProgress({ status: "running", message: "已排队 " + activeJobs.length + " 个视频详情", pending: activeJobs.length, running: 0, done: 0, failed: 0 });
+    startDetailQueue();
+  } else if (!activeJobs.length) {
     setProgress({ status: "idle", message: "没有缺失详情的视频", pending: 0, running: 0 });
   }
 
@@ -659,55 +722,64 @@ async function queueMissingVideoDetails() {
     detailQueueResult: {
       candidates: missingDetailBvids.length,
       queued,
-      pending: activeJobs.length
+      pending: activeJobs.length,
+      pausedUntil,
+      error: pausedUntil ? schedule.error : ""
     }
   });
 }
 
 function shouldFetchDetails(video) {
-  if (!video) return false;
-  if (video.viewCount == null) return true;
+  if (!video || video.detailCheckedAt) return false;
+  if (video.viewCount == null || !video.coverUrl || !video.pageParts?.length) return true;
   if (!video.tname || !video.desc || !Array.isArray(video.tags) || !video.tags.length) return true;
   return false;
 }
 
 async function fetchWatchlaterFromApi() {
-  const endpoints = [
-    "https://api.bilibili.com/x/v2/history/toview?jsonp=jsonp",
-    "https://api.bilibili.com/x/v2/history/toview"
-  ];
-  let lastError = null;
-  for (const url of endpoints) {
-    try {
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(10000),
-        credentials: "include",
-        headers: { "accept": "application/json,text/plain,*/*" }
-      });
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      const json = await response.json();
-      if (json.code !== 0) {
-        const error = new Error(json.message || ("B站接口返回 code " + json.code));
-        error.biliCode = Number(json.code);
-        throw error;
-      }
-      const list = findVideoList(json.data);
-      return list.map((item, index) => convertBiliApiVideo(item, index)).filter(Boolean);
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      if (lastError.biliCode === -101) break;
+  const response = await fetch("https://api.bilibili.com/x/v2/history/toview", {
+    signal: AbortSignal.timeout(10000),
+    credentials: "include",
+    cache: "no-store",
+    headers: { accept: "application/json,text/plain,*/*" }
+  });
+  if (!response.ok) throw Object.assign(new Error("HTTP " + response.status), {
+    status: response.status, retryAt: core.retryAfterAt(response)
+  });
+  const json = await response.json();
+  if (json.code !== 0) throw Object.assign(new Error(json.message || ("B站接口返回 code " + json.code)), {
+    biliCode: Number(json.code)
+  });
+  const list = readCompleteWatchlaterList(json.data);
+  const items = [];
+  const unidentifiedAids = [];
+  const bvids = new Set();
+  for (const [index, item] of list.entries()) {
+    const video = convertBiliApiVideo(item, index);
+    if (!video || !/^BV[0-9A-Za-z]{10}$/.test(video.bvid)) {
+      unidentifiedAids.push(Number(item.aid));
+      continue;
     }
+    if (bvids.has(video.bvid)) throw new Error("B站列表包含重复的视频编号");
+    bvids.add(video.bvid);
+    items.push(video);
   }
-  throw lastError || new Error("稍后再看接口不可用");
+  return { items, unidentifiedAids };
 }
 
-function findVideoList(data) {
-  if (!data) return [];
-  if (Array.isArray(data.list)) return data.list;
-  if (data.list && Array.isArray(data.list.list)) return data.list.list;
-  if (Array.isArray(data.items)) return data.items;
-  if (Array.isArray(data)) return data;
-  return [];
+function readCompleteWatchlaterList(data) {
+  const list = data && (Array.isArray(data.list) ? data.list : data.count === 0 && data.list === null ? [] : null);
+  if (!list || !Number.isInteger(data.count) || data.count !== list.length) {
+    throw new Error("B站未返回完整的稍后再看列表");
+  }
+  const aids = new Set();
+  for (const item of list) {
+    const rawAid = item?.aid;
+    const aid = typeof rawAid === "number" || typeof rawAid === "string" ? Number(rawAid) : NaN;
+    if (!Number.isSafeInteger(aid) || aid <= 0 || aids.has(aid)) throw new Error("B站列表的视频编号异常");
+    aids.add(aid);
+  }
+  return list;
 }
 
 function convertBiliApiVideo(item, index) {
@@ -715,8 +787,8 @@ function convertBiliApiVideo(item, index) {
   if (!bvid) return null;
   const owner = item.owner || item.author || {};
   const duration = Number(item.duration) || 0;
-  const rawProgress = Number(item.progress);
-  const hasProgress = Number.isFinite(rawProgress);
+  const rawProgress = core.finiteNumberOrNull(item.progress);
+  const hasProgress = rawProgress !== null;
   return {
     bvid,
     oid: item.oid,
@@ -741,43 +813,60 @@ function convertBiliApiVideo(item, index) {
   };
 }
 
-async function removeFromWatchlater(message) {
-  return runWatchlaterMembershipTask(() => removeFromWatchlaterUnlocked(message));
+async function removeFromWatchlater(message, sourceTab) {
+  watchlaterScan = null;
+  return runWatchlaterMembershipTask(() => removeFromWatchlaterUnlocked(message, sourceTab));
 }
 
-async function removeFromWatchlaterUnlocked(message) {
+async function removeFromWatchlaterUnlocked(message, sourceTab) {
   const bvid = core.normalizeBvid(message && message.bvid);
   if (!bvid) throw new Error("缺少 bvid");
 
   const video = await db.get("videos", bvid);
   if (!video) throw new Error("本地记录中没有这个视频：" + bvid);
   // Resolve the current aid from the server list, including unavailable videos.
-  const result = await requestWatchlaterRemove(video.aid || video.oid, bvid);
+  const result = await requestWatchlaterRemove(video.aid || video.oid, bvid, sourceTab);
   if (!result || result.verified !== true) throw new Error("未能核实 B站删除结果，请同步列表后重试");
-  await db.markRemoved(bvid);
+  const removed = await db.markRemoved(bvid);
   return Object.assign(await getState(), {
-    removeResult: result
+    removeResult: { ...result, watchlaterMembershipRevision: removed?.watchlaterMembershipRevision }
   });
 }
 
-async function requestWatchlaterRemove(aid, bvid) {
-  const csrf = await getBiliCsrf();
-  let pageError = null;
-  try {
-    const tab = await findBilibiliTab() || await loadExistingBilibiliTab();
-    if (tab) {
-      return await requestWatchlaterRemoveFromPage(aid, csrf, bvid, tab);
+async function requestWatchlaterRemove(aid, bvid, sourceTab) {
+  const pageFailures = [];
+  const tabs = await chrome.tabs.query({});
+  const candidates = (tabs || []).filter(tab => tab.id != null &&
+    Boolean(tab.incognito) === Boolean(sourceTab?.incognito) &&
+    isBilibiliUrl(tab.pendingUrl || tab.url));
+  const remaining = candidates.slice();
+  let tab = findBilibiliTab(remaining);
+  while (tab) {
+    try {
+      return await requestWatchlaterRemoveFromPage(aid, bvid, tab);
+    } catch (error) {
+      if (error.retryable === false) throw new Error("B站页面 · " + error.message);
+      pageFailures.push(error.message);
+      remaining.splice(remaining.indexOf(tab), 1);
+      tab = findBilibiliTab(remaining);
     }
-  } catch (error) {
-    if (error.retryable === false) throw error;
-    pageError = error;
   }
   try {
+    const prepared = await loadExistingBilibiliTab(remaining);
+    if (prepared) return await requestWatchlaterRemoveFromPage(aid, bvid, prepared);
+  } catch (error) {
+    if (error.retryable === false) throw new Error("B站页面 · " + error.message);
+    pageFailures.push(error.message);
+  }
+  const pageStatus = pageFailures.length ? "B站页面不可用（" + pageFailures.join("；") + "）"
+    : candidates.some(candidate => candidate.frozen) ? "B站标签页已休眠，请切到该标签页唤醒"
+      : "未找到可用的 B站标签页，请在同一个浏览器窗口打开 B站稍后再看";
+  if (sourceTab?.incognito) throw new Error(pageStatus);
+  try {
+    const csrf = await getBiliCsrf();
     return readWatchlaterRemovalResult(await performWatchlaterRemoval({ aid, csrf, bvid, deadline: Date.now() + 20000 }));
   } catch (error) {
-    if (error.name === "TimeoutError") error = new Error("B站后台删除请求超时，请重试");
-    if (pageError) throw new Error(pageError.message + "；后台重试失败：" + error.message);
-    throw new Error("没有已加载的 B站页面可用于删除。请点击一个 B站首页或视频标签页，等页面内容显示后返回重试。后台请求失败：" + error.message);
+    throw new Error(pageStatus + "。扩展后台 · " + error.message);
   }
 }
 
@@ -788,10 +877,7 @@ function readWatchlaterRemovalResult(result) {
   throw error;
 }
 
-async function requestWatchlaterRemoveFromPage(aid, csrf, bvid, tab) {
-  if (!tab || tab.id == null) {
-    throw new Error("B站限制了后台删除请求。请先打开任意 B站页面后重试；插件不会自动打开临时页面");
-  }
+async function requestWatchlaterRemoveFromPage(aid, bvid, tab) {
   let timer;
   const results = await Promise.race([chrome.scripting.executeScript({
     target: { tabId: tab.id },
@@ -799,12 +885,18 @@ async function requestWatchlaterRemoveFromPage(aid, csrf, bvid, tab) {
     // This request only needs fetch/cookies. Waiting for all page resources can
     // block deletion forever on tabs with stalled images or third-party scripts.
     injectImmediately: true,
-    args: [{ aid, csrf, bvid, deadline: Date.now() + 20000 }],
+    args: [{ aid, bvid, fromPage: true, deadline: Date.now() + 20000 }],
     func: performWatchlaterRemoval
   }), new Promise((resolve, reject) => {
     timer = setTimeout(() => reject(Object.assign(new Error("B站页面无响应，请刷新该页面并同步列表后重试"), { retryable: false })), 22000);
-  })]).finally(() => clearTimeout(timer));
-  return readWatchlaterRemovalResult(results && results[0] && results[0].result);
+  })]).catch((error) => {
+    if (error.retryable === false) throw error;
+    const rejectedBeforeInjection = /No tab with id|Cannot access contents|Missing host permission/i.test(error.message);
+    throw Object.assign(new Error("无法在 B站标签页运行删除操作：" + error.message), { retryable: rejectedBeforeInjection });
+  }).finally(() => clearTimeout(timer));
+  const result = results?.[0]?.result;
+  if (!result) throw Object.assign(new Error("B站页面未返回移出结果，请先同步列表确认"), { retryable: false });
+  return readWatchlaterRemovalResult(result);
 }
 
 // Self-contained: this exact function also runs in the Bilibili page's MAIN world.
@@ -822,7 +914,12 @@ async function performWatchlaterRemoval(request) {
     const response = await fetch("https://api.bilibili.com" + path, Object.assign({
       credentials: "include", cache: "no-store", signal: controller.signal
     }, options));
-    if (!response.ok) throw new Error("HTTP " + response.status);
+    if (!response.ok) {
+      const rejected = [401, 403, 412, 429].includes(response.status);
+      const advice = response.status === 412 ? "。B站拒绝了本次请求，可在 B站稍后再看页面操作后再同步"
+        : response.status === 429 ? "。请求过于频繁，请稍后再试" : "";
+      throw Object.assign(new Error("HTTP " + response.status + advice), { retryable: rejected ? false : undefined });
+    }
     const json = await response.json();
     if (!json || json.code !== 0) {
       const code = json && json.code;
@@ -843,6 +940,9 @@ async function performWatchlaterRemoval(request) {
     return items;
   }
   try {
+    if (request.fromPage && location.origin !== "https://www.bilibili.com") {
+      throw new Error("标签页正在打开 B站，请等待页面显示后重试");
+    }
     if (!/^BV[0-9A-Za-z]{10}$/.test(request.bvid)) throw Object.assign(new Error("视频编号无效"), { retryable: false });
     const before = await list();
     const target = before.find((item) => item.bvid === request.bvid);
@@ -887,27 +987,30 @@ async function performWatchlaterRemoval(request) {
   }
 }
 
-async function findBilibiliTab() {
-  const candidates = await chrome.tabs.query({ url: "https://www.bilibili.com/*" });
-  // Restored tabs can be unloaded without being marked discarded or frozen.
-  const tabs = (candidates || []).filter((tab) => tab.status !== "unloaded" && !tab.discarded && !tab.frozen && tab.id != null);
-  if (!tabs.length) return null;
-  return tabs.find((tab) => tab.status === "complete" && tab.active) ||
-    tabs.find((tab) => tab.status === "complete") ||
-    tabs[0];
+function isBilibiliUrl(url) {
+  return /^https:\/\/www\.bilibili\.com\//.test(url || "");
 }
 
-async function loadExistingBilibiliTab() {
-  const candidates = await chrome.tabs.query({ url: "https://www.bilibili.com/*" });
-  const candidate = (candidates || []).find((tab) => tab.id != null &&
-    (tab.status === "unloaded" || tab.discarded) && !tab.pendingUrl);
+function findBilibiliTab(candidates) {
+  // Restored tabs can be unloaded without being marked discarded or frozen.
+  const tabs = candidates.filter((tab) => isBilibiliUrl(tab.url) && (!tab.pendingUrl || tab.pendingUrl === tab.url) &&
+    tab.status !== "unloaded" && !tab.discarded && !tab.frozen);
+  return tabs.find((tab) => tab.status === "complete" && /^\/(?:watchlater\/list|list\/watchlater)(?:\/|$)/.test(new URL(tab.url).pathname)) ||
+    tabs.find((tab) => tab.status === "complete" && tab.active) ||
+    tabs.find((tab) => tab.status === "complete") ||
+    tabs[0] || null;
+}
+
+async function loadExistingBilibiliTab(candidates) {
+  const candidate = candidates.find((tab) => !tab.frozen &&
+    (isBilibiliUrl(tab.pendingUrl) || tab.status === "unloaded" || tab.discarded));
   if (!candidate) return null;
   // Recheck before reloading: the user may have started watching this tab.
   const current = await chrome.tabs.get(candidate.id);
-  if (!/^https:\/\/www\.bilibili\.com\//.test(current.url || "") || current.pendingUrl) {
+  if (!isBilibiliUrl(current.pendingUrl || current.url)) {
     throw new Error("B站标签页正在跳转，请重试");
   }
-  if (current.status === "unloaded" || current.discarded) {
+  if (!current.pendingUrl && (current.status === "unloaded" || current.discarded)) {
     // Reload the existing URL in the background; never activate or replace it.
     await chrome.tabs.reload(current.id);
   }
@@ -918,11 +1021,11 @@ async function loadExistingBilibiliTab() {
       (async () => {
         while (Date.now() < deadline) {
           const tab = await chrome.tabs.get(current.id);
-          if (!/^https:\/\/www\.bilibili\.com\//.test(tab.url || "") ||
-              tab.pendingUrl && !/^https:\/\/www\.bilibili\.com\//.test(tab.pendingUrl)) {
+          if (!isBilibiliUrl(tab.pendingUrl || tab.url)) {
             throw new Error("B站标签页正在跳转，请重试");
           }
-          if (tab.status !== "unloaded" && !tab.discarded && !tab.frozen) {
+          if (isBilibiliUrl(tab.url) && (!tab.pendingUrl || tab.pendingUrl === tab.url) &&
+              tab.status !== "unloaded" && !tab.discarded && !tab.frozen) {
             try {
               // Probe the committed document, not the tab's cached URL or load event.
               const results = await chrome.scripting.executeScript({
@@ -968,133 +1071,204 @@ async function getBiliCsrf() {
 }
 
 function startDetailQueue() {
-  if (!detailRunPromise) {
-    detailRunPromise = processDetailQueue()
-      .catch((error) => setProgress({ status: "error", message: error && error.message ? error.message : String(error), running: 0 }))
-      .finally(() => {
-        detailRunPromise = null;
-      });
+  if (detailRunPromise) {
+    detailRerunRequested = true;
+    return;
   }
+  detailRunPromise = processDetailQueue()
+    .catch((error) => setProgress({ status: "error", message: error && error.message ? error.message : String(error), running: 0 }))
+    .finally(() => {
+      detailRunPromise = null;
+      if (detailRerunRequested) {
+        detailRerunRequested = false;
+        startDetailQueue();
+      }
+    });
+}
+
+async function scheduleDetailQueue(resumeAt, error = "") {
+  await db.put("meta", { key: DETAIL_ALARM, resumeAt, error });
+  await chrome.alarms.create(DETAIL_ALARM, { when: resumeAt });
+}
+
+function detailSortTime(video) {
+  const timestamp = Number(video.watchlaterAddedAt || video.firstSeenAt) || 0;
+  return timestamp < 1e12 ? timestamp * 1000 : timestamp;
 }
 
 async function processDetailQueue() {
   const config = await getConfig();
-  const concurrency = config.settings.detailConcurrency || 3;
-  let pending = await db.pendingJobs("detail");
-  setProgress({ status: pending.length ? "running" : "idle", message: pending.length ? "正在更新视频详情" : "没有待更新详情", pending: pending.length, running: 0, done: 0, failed: 0 });
+  if (!config.settings.detailFetchEnabled) return;
 
-  while (pending.length) {
-    const chunk = pending.slice(0, concurrency);
-    pending = pending.slice(concurrency);
-    setProgress({ running: chunk.length, pending: pending.length });
-    await Promise.all(chunk.map(processDetailJob));
+  const [pending, videos, schedule, initialLibrary, combinedBackoff] = await Promise.all([
+    db.pendingJobs("detail"), db.getAll("videos"), db.get("meta", DETAIL_ALARM),
+    db.get("meta", core.INITIAL_LIBRARY_SYNC_KEY), db.get("meta", COMBINED_DETAILS_BACKOFF)
+  ]);
+  const byBvid = new Map(videos.map(video => [video.bvid, video]));
+  const remaining = [];
+  for (const job of pending) {
+    const video = byBvid.get(job.bvid);
+    if (video?.presentInWatchlater !== false && shouldFetchDetails(video)) remaining.push(job);
+    else await db.updateJob(job.id, { status: "done" });
+  }
+  if (!remaining.length) {
+    await db.put("meta", { key: DETAIL_ALARM });
+    await chrome.alarms.clear(DETAIL_ALARM);
+    setProgress({ status: "idle", message: "详情更新完成", pending: 0, running: 0 });
+    return;
   }
 
-  setProgress({ status: "idle", message: "详情更新完成", pending: 0, running: 0 });
-}
-
-async function processDetailJob(job) {
-  await db.updateJob(job.id, { status: "running", attempts: (job.attempts || 0) + 1 });
-  try {
-    const details = await fetchVideoDetails(job.bvid);
-    await db.upsertVideos([Object.assign({}, details, { bvid: job.bvid })]);
-    await db.updateJob(job.id, { status: "done", error: "" });
-    setProgress({ done: progress.done + 1 });
-  } catch (error) {
-    await db.updateJob(job.id, { status: "failed", error: error && error.message ? error.message : String(error) });
-    setProgress({ failed: progress.failed + 1 });
+  const now = Date.now();
+  const ready = remaining.filter(job => !(job.retryAt > now));
+  ready.sort((a, b) => detailSortTime(byBvid.get(b.bvid)) - detailSortTime(byBvid.get(a.bvid)));
+  const initialJobs = initialLibrary ? ready.filter(job =>
+    (byBvid.get(job.bvid).firstSeenAt || 0) <= initialLibrary.through) : [];
+  const initial = initialJobs.length > 0;
+  if (schedule?.resumeAt > now) {
+    await chrome.alarms.create(DETAIL_ALARM, { when: schedule.resumeAt });
+    return;
   }
-}
-
-async function fetchVideoDetails(bvid) {
-  const view = await fetchJson("https://api.bilibili.com/x/web-interface/view?bvid=" + encodeURIComponent(bvid));
-  if (!view || view.code !== 0 || !view.data) {
-    return fetchVideoDetailsFromHtml(bvid);
+  if (globalThis.navigator?.onLine === false) {
+    await scheduleDetailQueue(now + DETAIL_ERROR_PAUSE, "当前未联网");
+    setProgress({ status: "error", message: "详情更新已暂停：当前未联网", pending: remaining.length, running: 0 });
+    return;
+  }
+  if (!ready.length) {
+    await scheduleDetailQueue(Math.min(...remaining.map(job => job.retryAt)));
+    setProgress({ status: "idle", message: "部分视频详情暂不可用，稍后重试", pending: remaining.length, running: 0 });
+    return;
   }
 
-  let tags = [];
-  try {
-    const tagJson = await fetchJson("https://api.bilibili.com/x/tag/archive/tags?bvid=" + encodeURIComponent(bvid));
-    if (tagJson && tagJson.code === 0 && Array.isArray(tagJson.data)) {
-      tags = tagJson.data.map((tag) => tag.tag_name || tag.name).filter(Boolean);
+  const batch = initial ? initialJobs.slice(0, INITIAL_DETAIL_BATCH_SIZE) : ready.slice(0, DETAIL_BATCH_SIZE);
+  const requestInterval = initial ? INITIAL_DETAIL_REQUEST_INTERVAL : DETAIL_REQUEST_INTERVAL;
+  // Schedule before starting so a suspended worker can resume any unfinished job.
+  const nextBatchAt = now + DETAIL_BATCH_INTERVAL;
+  await scheduleDetailQueue(nextBatchAt);
+  setProgress({ status: "running", message: initial ? "正在首次补齐视频详情" : "正在分批补充视频详情",
+    pending: remaining.length, running: 1, done: 0, failed: 0 });
+
+  let lastRequestAt = 0;
+  async function requestDetails(path) {
+    const wait = lastRequestAt + requestInterval - Date.now();
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+    lastRequestAt = Date.now();
+    const response = await fetch("https://api.bilibili.com" + path, {
+      signal: AbortSignal.timeout(8000),
+      credentials: "include",
+      headers: { accept: "application/json,text/plain,*/*" }
+    });
+    if (!response.ok) {
+      if (response.status === 412 && path.startsWith("/x/web-interface/view/detail?")) {
+        await db.put("meta", { key: COMBINED_DETAILS_BACKOFF, retryAt: Date.now() + 24 * 60 * 60000 });
+      }
+      throw Object.assign(new Error("HTTP " + response.status), {
+        status: response.status, retryAt: core.retryAfterAt(response)
+      });
     }
-  } catch (error) {
-    tags = [];
+    const result = await response.json();
+    if (result?.code !== 0) {
+      throw Object.assign(new Error(result?.message || "B 站详情接口返回异常"), { biliCode: Number(result?.code) });
+    }
+    return result.data;
   }
 
-  const data = view.data;
+  const changedVideos = new Map();
+  let done = 0;
+  let failed = 0;
+  let lastProgressAt = Date.now();
+  async function saveDetail(changes) {
+    const saved = await db.upsertVideos([changes]);
+    if (saved?.errors?.length) throw new Error(saved.errors[0]);
+    const video = saved?.results[0]?.video;
+    if (video) changedVideos.set(video.bvid, video);
+  }
+  function publishDetails() {
+    if (!changedVideos.size) return;
+    globalThis.BiliWLCoverWorker?.start();
+    chrome.runtime.sendMessage({ type: core.MESSAGE_TYPES.DETAILS_SAVED, videos: [...changedVideos.values()] }).catch(() => {});
+  }
+  for (const job of batch) {
+    try {
+      const video = byBvid.get(job.bvid);
+      const query = "?bvid=" + encodeURIComponent(job.bvid);
+      let tags;
+      if (!video.detailViewCheckedAt && (video.viewCount == null || !video.tname || !video.desc || !video.coverUrl || !video.pageParts?.length)) {
+        const canCombine = !video.tags?.length && !(combinedBackoff?.retryAt > now);
+        const details = await fetchVideoDetails(job.bvid, requestDetails, canCombine);
+        tags = details.tags;
+        await saveDetail({ ...details, bvid: job.bvid, detailViewCheckedAt: Date.now() });
+      }
+      if (tags === undefined && !video.tags?.length) {
+        const data = await requestDetails("/x/tag/archive/tags" + query);
+        if (data != null && !Array.isArray(data)) throw new Error("B 站返回的标签格式异常");
+        tags = (data || []).map(tag => tag?.tag_name || tag?.name).filter(Boolean);
+      }
+      await saveDetail({ bvid: job.bvid, tags, detailCheckedAt: Date.now() });
+      await db.updateJob(job.id, { status: "done", error: "", retryAt: 0 });
+      done++;
+    } catch (error) {
+      const message = error.message || String(error);
+      if (UNAVAILABLE_VIDEO_CODES.has(error.biliCode)) {
+        await saveDetail({ bvid: job.bvid, detailCheckedAt: Date.now() });
+        await db.updateJob(job.id, { status: "done", error: message, retryAt: 0 });
+        failed++;
+      } else {
+        const resumeAt = Math.max(Date.now() + DETAIL_ERROR_PAUSE, error.retryAt || 0);
+        await scheduleDetailQueue(resumeAt, message);
+        await db.updateJob(job.id, {
+          status: "pending", error: message,
+          retryAt: Math.max(resumeAt, Date.now() + 3600000)
+        });
+        publishDetails();
+        setProgress({ status: "error", message: "详情更新已暂停：" + message, running: 0,
+          done, failed: failed + 1, pending: remaining.length - done - failed });
+        return;
+      }
+    }
+    if (Date.now() - lastProgressAt >= 500) {
+      lastProgressAt = Date.now();
+      setProgress({ done, failed, pending: remaining.length - done - failed });
+    }
+  }
+
+  const left = (await db.pendingJobs("detail")).length;
+  if (left) {
+    await scheduleDetailQueue(Math.max(nextBatchAt, lastRequestAt + requestInterval));
+  } else {
+    await db.put("meta", { key: DETAIL_ALARM });
+    await chrome.alarms.clear(DETAIL_ALARM);
+  }
+  publishDetails();
+  setProgress({ status: "idle", message: left ? "本批详情已保存，稍后继续" : "详情更新完成", pending: left, running: 0, done, failed });
+}
+
+async function fetchVideoDetails(bvid, requestDetails, needsTags) {
+  const query = "?bvid=" + encodeURIComponent(bvid);
+  let combined;
+  if (needsTags) {
+    combined = await requestDetails("/x/web-interface/view/detail" + query).catch(error => {
+      if (error.status !== 404) throw error;
+      return null;
+    });
+  }
+  const data = combined?.View || await requestDetails("/x/web-interface/view" + query);
+  if (!data || core.normalizeBvid(data.bvid) !== bvid) throw new Error("B 站未返回匹配的视频详情");
   const owner = data.owner || {};
   return {
-    bvid: data.bvid || bvid,
     oid: data.aid,
     aid: data.aid,
     title: data.title,
-    pageUrl: "https://www.bilibili.com/video/" + (data.bvid || bvid),
     upName: owner.name,
     upMid: owner.mid,
     coverUrl: data.pic,
     tname: data.tname_v2 || data.tname,
-    tags,
     desc: data.desc,
     duration: data.duration,
-    viewCount: data.stat && data.stat.view,
+    viewCount: data.stat?.view,
     pubdate: data.pubdate || data.ctime,
-    pageParts: Array.isArray(data.pages) ? data.pages.map((page) => page.part).filter(Boolean) : []
+    tags: Array.isArray(combined?.Tags) ? combined.Tags.map(tag => tag?.tag_name || tag?.name).filter(Boolean) : undefined,
+    pageParts: Array.isArray(data.pages) ? data.pages.map(page => page.part).filter(Boolean) : []
   };
-}
-
-async function fetchJson(url) {
-  const response = await fetch(url, {
-    credentials: "include",
-    headers: { "accept": "application/json,text/plain,*/*" }
-  });
-  if (!response.ok) throw new Error("HTTP " + response.status);
-  return response.json();
-}
-
-async function fetchVideoDetailsFromHtml(bvid) {
-  const response = await fetch("https://www.bilibili.com/video/" + encodeURIComponent(bvid), {
-    credentials: "include",
-    headers: { "accept": "text/html,*/*" }
-  });
-  if (!response.ok) throw new Error("详情页 HTTP " + response.status);
-  const html = await response.text();
-  const titleMatch = html.match(/<title>([\s\S]*?)<\/title>/i);
-  const descMatch = html.match(/<meta\s+name=["']description["']\s+content=["']([\s\S]*?)["']/i);
-  const initialMatch = html.match(/window\.__INITIAL_STATE__=([\s\S]*?);\(function\(\)/);
-  let parsed = null;
-  if (initialMatch) {
-    try {
-      parsed = JSON.parse(initialMatch[1]);
-    } catch (error) {
-      parsed = null;
-    }
-  }
-  const videoData = parsed && (parsed.videoData || parsed.videoInfo || {});
-  const aid = videoData && videoData.aid || parsed && parsed.aid;
-  return {
-    bvid,
-    oid: aid,
-    aid,
-    title: videoData && videoData.title ? videoData.title : cleanHtmlText(titleMatch && titleMatch[1]),
-    pageUrl: "https://www.bilibili.com/video/" + bvid,
-    desc: videoData && videoData.desc ? videoData.desc : cleanHtmlText(descMatch && descMatch[1]),
-    tname: videoData && videoData.tname,
-    coverUrl: videoData && videoData.pic,
-    duration: videoData && videoData.duration,
-    viewCount: videoData && videoData.stat && videoData.stat.view,
-    pubdate: videoData && (videoData.pubdate || videoData.ctime)
-  };
-}
-
-function cleanHtmlText(value) {
-  return core.normalizeText(String(value || "")
-    .replace(/&quot;/g, "\"")
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/_哔哩哔哩_bilibili$/i, ""));
 }
 
 function setProgress(patch) {
@@ -1104,7 +1278,7 @@ function setProgress(patch) {
 
 async function exportCategoryProposal(message) {
   const config = await getConfig();
-  const summary = await db.summary();
+  const summary = await db.summary({ includeJobs: false });
   const candidates = shuffledCopy(summary.videos
     .filter((video) => video && video.presentInWatchlater !== false));
   const requested = Math.min(100, Math.max(10, Number(message.limit) || 60));
@@ -1125,7 +1299,7 @@ async function importCategories(message) {
   const nextIds = new Set(categories.map((category) => category.id));
   const addedCategoryIds = categories.map((category) => category.id).filter((id) => !previousIds.has(id));
   const removedIds = new Set(Array.from(previousIds).filter((id) => !nextIds.has(id)));
-  await chromeStorageSet({ categories });
+  await storeCategoryDirectory(categories, core.normalizeText(message.source) || "llm");
   await cleanupDeletedCategoryReferences(removedIds, categories);
 
   const onboardingPending = config.settings.onboardingEligible === true && config.settings.onboardingCompleted !== true;
@@ -1133,22 +1307,24 @@ async function importCategories(message) {
     ? { checked: 0, matchedVideos: 0, addedAssignments: 0, skipped: true }
     : await appendKeywordCategories(addedCategoryIds, categories);
 
-  const data = await chromeStorageGet(["settings"]);
-  const settings = Object.assign({}, core.DEFAULT_SETTINGS, data.settings || {}, {
-    categoryListUpdatedAt: Date.now(),
-    categoryListSource: core.normalizeText(message.source) || "llm"
-  });
-  await chromeStorageSet({ settings });
-  return Object.assign(await getState(), {
+  const nextState = await getState();
+  return Object.assign(nextState, {
     categoryImportResult: {
       imported: categories.length,
       roots: categories.filter((category) => !category.parentId).length,
-      source: settings.categoryListSource,
+      source: nextState.settings.categoryListSource,
       addedCategoryIds,
       removedCategoryIds: Array.from(removedIds),
       keywordResult
     }
   });
+}
+
+async function storeCategoryDirectory(categories, source = "manual") {
+  const data = await chromeStorageGet(["settings"]);
+  await chromeStorageSet({ categories, settings: {
+    ...core.DEFAULT_SETTINGS, ...data.settings, categoryListSource: source, categoryListUpdatedAt: Date.now()
+  } });
 }
 
 function preserveManualCategoryDefinitions(importedCategories, previousCategories, classifications) {
@@ -1261,13 +1437,15 @@ function normalizeImportedCategories(payload, options) {
 
 async function exportClassifyBatch(message) {
   const config = await getConfig();
-  const summary = await db.summary();
+  const summary = await db.summary({ includeJobs: false });
   const classificationByBvid = new Map(summary.classifications.map((item) => [item.bvid, item]));
   const includeAll = Boolean(message.includeAll);
   const excludedBvids = new Set(message.excludedBvids || []);
   const offset = Math.max(0, Number(message.offset || 0));
   let candidates = summary.videos
     .filter((video) => !excludedBvids.has(video.bvid))
+    .filter((video) => !message.attemptedSources ||
+      message.attemptedSources[video.bvid] !== (video.sourceHash || core.computeSourceHash(video)))
     .filter((video) => video.presentInWatchlater !== false)
     .filter((video) => {
       const classification = classificationByBvid.get(video.bvid);
@@ -1276,7 +1454,7 @@ async function exportClassifyBatch(message) {
     })
     .sort((a, b) => (b.lastSeenAt || 0) - (a.lastSeenAt || 0));
   if (message.randomize) candidates = shuffledCopy(candidates);
-  const limit = exportLimit(message.limit, config.settings.manualExportLimit || config.settings.batchSize, candidates.length);
+  const limit = exportLimit(message.limit, config.settings.manualExportLimit ?? config.settings.batchSize, candidates.length);
   const batch = candidates.slice(offset, offset + limit);
   return {
     prompt: core.buildClassificationPrompt(batch, config.categories, Object.assign({}, config.settings, {
@@ -1304,33 +1482,32 @@ function shuffledCopy(items) {
 }
 
 function exportLimit(rawLimit, defaultLimit, total) {
-  if (rawLimit === "all") return Math.max(0, total);
-  const number = Number(rawLimit || defaultLimit || 80);
-  if (!Number.isFinite(number)) return Math.min(100, Math.max(1, Number(defaultLimit) || 80));
-  return Math.min(100, Math.max(1, number));
+  const number = core.finiteNumberOrNull(rawLimit) ?? core.finiteNumberOrNull(defaultLimit) ?? 80;
+  if (rawLimit === "all" || number === 0) return Math.max(0, total);
+  return Math.min(500, Math.max(1, Math.floor(number)));
 }
 
 async function resetForLlmReclassify() {
-  const summary = await db.summary();
+  if (autoLlmRunPromise) await autoLlmRunPromise.catch(() => {});
+  const summary = await db.summary({ includeJobs: false });
   let removedClassifications = 0;
   let keptManual = 0;
 
   for (const classification of summary.classifications) {
-    if (core.isManualClassification(classification)) {
+    const updated = await db.updateClassification(classification.bvid, (current) => {
+      if (!current) return;
+      if (!core.isManualClassification(current)) return null;
       keptManual += 1;
-      if (classification.sourceType !== core.CLASSIFICATION_SOURCE_TYPES.MANUAL || !classification.manualOverride) {
-        await db.putClassification(Object.assign({}, classification, {
-          sourceType: core.CLASSIFICATION_SOURCE_TYPES.MANUAL,
-          manualOverride: true
-        }));
+      if (current.sourceType !== core.CLASSIFICATION_SOURCE_TYPES.MANUAL || !current.manualOverride) {
+        return { ...current, sourceType: core.CLASSIFICATION_SOURCE_TYPES.MANUAL, manualOverride: true };
       }
-      continue;
-    }
-    await db.remove("classifications", classification.bvid);
-    removedClassifications += 1;
+    });
+    if (updated === null) removedClassifications += 1;
   }
 
-  await db.clear("jobs");
+  const clearedJobs = await db.removeJobsExcept("detail");
+  await chrome.storage.local.remove(["autoLlmAttemptedBvids", "autoLlmAttempts", "autoLlmRetryAt"]);
+  await chrome.alarms.clear(AUTO_LLM_CONTINUE_ALARM);
   setProgress({
     status: "idle",
     message: "已重置 AI 全局视频分类：清除非手动确认结果 " + removedClassifications + " 项，保留手动确认 " + keptManual + " 项",
@@ -1345,14 +1522,14 @@ async function resetForLlmReclassify() {
     resetResult: {
       removedClassifications,
       keptManual,
-      clearedJobs: (summary.jobs || []).length
+      clearedJobs
     }
   });
 }
 
 async function importClassifications(payload, options) {
   const config = await getConfig();
-  const summary = await db.summary();
+  const summary = await db.summary({ includeJobs: false });
   const parsed = core.parseClassificationPayload(payload);
   const validated = core.validateClassificationItems(parsed.items, config.categories, summary.videos);
   const videosByBvid = new Map(summary.videos.map((video) => [video.bvid, video]));
@@ -1365,22 +1542,19 @@ async function importClassifications(payload, options) {
       skipped += 1;
       continue;
     }
-    const existing = await db.getClassification(item.bvid);
-    const incoming = Object.assign({}, item, {
-      classifierVersion: core.CLASSIFIER_VERSION,
-      manualOverride: false,
-      sourceType: core.CLASSIFICATION_SOURCE_TYPES.LLM
+    const saved = await db.updateClassification(item.bvid, (existing) => {
+      const incoming = {
+        ...item, classifierVersion: core.CLASSIFIER_VERSION,
+        manualOverride: false, sourceType: core.CLASSIFICATION_SOURCE_TYPES.LLM
+      };
+      if (options.mergeMode === "append" && existing && !core.isManualClassification(existing)) {
+        incoming.categoryIds = core.uniqueStrings([...(existing.categoryIds || []), ...(item.categoryIds || [])]);
+      }
+      const merged = core.mergeClassification(existing, incoming, video);
+      return merged.skippedImport ? undefined : merged;
     });
-    if (options.mergeMode === "append" && existing && !core.isManualClassification(existing)) {
-      incoming.categoryIds = core.uniqueStrings([...(existing.categoryIds || []), ...(item.categoryIds || [])]);
-    }
-    const merged = core.mergeClassification(existing, incoming, video);
-    if (merged.skippedImport) {
-      skipped += 1;
-      continue;
-    }
-    await db.putClassification(merged);
-    imported += 1;
+    if (saved) imported += 1;
+    else skipped += 1;
   }
 
   return Object.assign(await getState(), {
@@ -1392,6 +1566,17 @@ async function importClassifications(payload, options) {
   });
 }
 
+function initialClassificationSkipReason(video, existing, options) {
+  const source = core.classificationSourceType(existing);
+  if (options.unclassifiedOnly && existing && core.uniqueStrings(existing.categoryIds).length) return "unchanged";
+  if (source === core.CLASSIFICATION_SOURCE_TYPES.MANUAL) return "manual";
+  const needsClassification = core.needsClassification(video, existing);
+  if (!needsClassification && (!options.includeAll || source === core.CLASSIFICATION_SOURCE_TYPES.LLM && !options.includeLlm)) {
+    return "unchanged";
+  }
+  return "";
+}
+
 async function autoClassify(options) {
   const config = await getConfig();
   const selectedCategoryIds = core.uniqueStrings(options && options.selectedCategoryIds);
@@ -1401,10 +1586,8 @@ async function autoClassify(options) {
       autoClassifyResult: Object.assign({ targeted: true, selectedCategoryIds }, targetedResult)
     });
   }
-  const summary = await db.summary();
+  const summary = await db.summary({ includeJobs: false });
   const classificationByBvid = new Map(summary.classifications.map((item) => [item.bvid, item]));
-  const includeAll = Boolean(options.includeAll);
-  const unclassifiedOnly = Boolean(options.unclassifiedOnly);
   let classified = 0;
   let skippedManual = 0;
   let reclassifiedManual = 0;
@@ -1415,36 +1598,26 @@ async function autoClassify(options) {
   }
   for (const video of summary.videos) {
     if (!video || video.presentInWatchlater === false) continue;
-    const existing = classificationByBvid.get(video.bvid);
-    const existingSourceType = core.classificationSourceType(existing);
-    if (unclassifiedOnly && existing && core.uniqueStrings(existing.categoryIds).length) {
-      unchanged += 1;
-      continue;
+    let skipReason = initialClassificationSkipReason(video, classificationByBvid.get(video.bvid), options);
+    if (!skipReason) {
+      const categoryIds = core.inferCategoryIds(video, config.categories);
+      await db.updateClassification(video.bvid, (current) => {
+        skipReason = initialClassificationSkipReason(video, current, options);
+        if (skipReason) return;
+        return core.mergeClassification(current, {
+          bvid: video.bvid,
+          categoryIds,
+          confidence: categoryIds.includes("other.todo") ? 0.45 : 0.68,
+          reason: "本地关键词规则自动分类",
+          classifierVersion: core.LOCAL_CLASSIFIER_VERSION,
+          manualOverride: false,
+          sourceType: core.CLASSIFICATION_SOURCE_TYPES.KEYWORD
+        }, video);
+      });
     }
-    if (existingSourceType === core.CLASSIFICATION_SOURCE_TYPES.MANUAL) {
-      skippedManual += 1;
-      continue;
-    }
-    if (existingSourceType === core.CLASSIFICATION_SOURCE_TYPES.LLM && !core.needsClassification(video, existing) && !options.includeLlm) {
-      unchanged += 1;
-      continue;
-    }
-    if (!includeAll && !core.needsClassification(video, existing)) {
-      unchanged += 1;
-      continue;
-    }
-    const categoryIds = core.inferCategoryIds(video, config.categories);
-    const next = core.mergeClassification(existing, {
-      bvid: video.bvid,
-      categoryIds,
-      confidence: categoryIds.includes("other.todo") ? 0.45 : 0.68,
-      reason: "本地关键词规则自动分类",
-      classifierVersion: core.LOCAL_CLASSIFIER_VERSION,
-      manualOverride: false,
-      sourceType: core.CLASSIFICATION_SOURCE_TYPES.KEYWORD
-    }, video);
-    await db.putClassification(next);
-    classified += 1;
+    if (skipReason === "manual") skippedManual += 1;
+    else if (skipReason) unchanged += 1;
+    else classified += 1;
   }
 
   if (!options.silent) {
@@ -1468,6 +1641,9 @@ async function saveManualClassification(message) {
   const config = await getConfig();
   const validCategoryIds = core.uniqueStrings(message.categoryIds)
     .filter((id) => config.categories.some((category) => category.id === id && category.enabled !== false));
+  if (!validCategoryIds.length && !config.categories.some(category => category.id === "other.todo" && category.enabled !== false)) {
+    throw new Error("请至少选择一个有效分类");
+  }
   const classification = core.mergeClassification(await db.getClassification(bvid), {
     bvid,
     categoryIds: validCategoryIds.length ? validCategoryIds : ["other.todo"],
@@ -1498,15 +1674,18 @@ async function bulkUpdateClassifications(message) {
   for (const bvid of bvids) {
     const video = videosByBvid.get(bvid);
     if (!video) continue;
+    if (action === "clear") {
+      const removed = await db.updateClassification(bvid, current => current ? null : undefined);
+      if (removed === null) updated += 1;
+      continue;
+    }
     const existing = await db.getClassification(bvid);
-    const categoryIds = action === "clear"
-      ? []
-      : core.uniqueStrings([...(existing && existing.categoryIds || []), ...selectedCategoryIds]).filter((id) => validIds.has(id));
+    const categoryIds = core.uniqueStrings([...(existing && existing.categoryIds || []), ...selectedCategoryIds]).filter((id) => validIds.has(id));
     const classification = core.mergeClassification(existing, {
       bvid,
       categoryIds,
       confidence: 1,
-      reason: action === "clear" ? "批量清除分类" : "批量添加分类",
+      reason: "批量添加分类",
       manualOverride: true,
       sourceType: core.CLASSIFICATION_SOURCE_TYPES.MANUAL
     }, video, { forceManualOverride: true });
@@ -1531,7 +1710,7 @@ async function addCategory(message) {
   const siblings = config.categories.filter((category) => (category.parentId || "") === (parentId || ""));
   const order = siblings.reduce((max, category) => Math.max(max, Number(category.order) || 0), 0) + 10;
   const categories = config.categories.concat([{ id, name, parentId: parentId || undefined, order, enabled: true }]);
-  await chromeStorageSet({ categories });
+  await storeCategoryDirectory(categories);
   return Object.assign(await stateAfterCategoryAutoClassify(message), { addedCategory: { id, name, parentId: parentId || undefined, order, enabled: true } });
 }
 
@@ -1547,7 +1726,7 @@ async function saveCategories(message) {
   const addedCategoryIds = categories.map((category) => category.id).filter((id) => !previousIds.has(id));
   const removedIds = new Set(Array.from(previousIds).filter((id) => !nextIds.has(id)));
 
-  await chromeStorageSet({ categories });
+  await storeCategoryDirectory(categories);
   await cleanupDeletedCategoryReferences(removedIds, categories);
   const keywordResult = message.skipAutoClassify
     ? { checked: 0, matchedVideos: 0, addedAssignments: 0, skipped: true }
@@ -1566,25 +1745,23 @@ async function appendKeywordCategories(categoryIds, categories) {
   if (!selectedCategoryIds.length) {
     return { checked: 0, matchedVideos: 0, addedAssignments: 0 };
   }
-  const summary = await db.summary();
-  const classificationByBvid = new Map(summary.classifications.map((item) => [item.bvid, item]));
+  const summary = await db.summary({ includeJobs: false });
   let checked = 0;
   let matchedVideos = 0;
   let addedAssignments = 0;
 
   for (const video of summary.videos) {
     if (!video || video.presentInWatchlater === false) continue;
-    const existing = classificationByBvid.get(video.bvid);
     checked += 1;
     const matchedIds = core.inferSelectedCategoryIds(video, categories, selectedCategoryIds);
     if (!matchedIds.length) continue;
-    const existingIds = core.uniqueStrings(existing && existing.categoryIds);
-    const nextIds = core.uniqueStrings(existingIds.concat(matchedIds));
-    const addedCount = nextIds.length - existingIds.length;
-    if (!addedCount) continue;
-    const next = existing
-      ? core.appendClassificationCategoryIds(existing, matchedIds)
-      : core.mergeClassification(null, {
+    let addedCount = 0;
+    const updated = await db.updateClassification(video.bvid, (existing) => {
+      const existingIds = core.uniqueStrings(existing?.categoryIds);
+      const nextIds = core.uniqueStrings(existingIds.concat(matchedIds));
+      addedCount = nextIds.length - existingIds.length;
+      if (!addedCount) return;
+      return existing ? core.appendClassificationCategoryIds(existing, matchedIds) : core.mergeClassification(null, {
         bvid: video.bvid,
         categoryIds: nextIds,
         confidence: 0.68,
@@ -1593,7 +1770,8 @@ async function appendKeywordCategories(categoryIds, categories) {
         manualOverride: false,
         sourceType: core.CLASSIFICATION_SOURCE_TYPES.KEYWORD
       }, video);
-    await db.putClassification(next);
+    });
+    if (!updated) continue;
     matchedVideos += 1;
     addedAssignments += addedCount;
   }
@@ -1623,7 +1801,7 @@ async function updateCategory(message) {
   const siblings = categories.filter((item) => item.id !== id && (item.parentId || "") === (category.parentId || ""));
   category.order = siblings.reduce((max, item) => Math.max(max, Number(item.order) || 0), 0) + 10;
 
-  await chromeStorageSet({ categories });
+  await storeCategoryDirectory(categories);
   return Object.assign(await stateAfterCategoryAutoClassify(message), { updatedCategory: category });
 }
 
@@ -1642,7 +1820,7 @@ async function deleteCategory(message) {
   const categories = preserveManualCategoryDefinitions(proposedCategories, config.categories, classifications);
   const retainedIds = new Set(categories.map((category) => category.id));
   const deletedIds = new Set(Array.from(removeIds).filter((categoryId) => !retainedIds.has(categoryId)));
-  await chromeStorageSet({ categories });
+  await storeCategoryDirectory(categories);
   await cleanupDeletedCategoryReferences(deletedIds, categories);
   return Object.assign(await stateAfterCategoryAutoClassify(message), { deletedCategoryIds: Array.from(deletedIds) });
 }
@@ -1662,14 +1840,14 @@ async function cleanupDeletedCategoryReferences(removeIds, categories) {
   const validIds = new Set((categories || []).filter((category) => category.enabled !== false).map((category) => category.id));
   const classifications = await db.getAll("classifications");
   for (const classification of classifications) {
-    const invalidIds = core.uniqueStrings(classification.categoryIds)
-      .filter((id) => removeIds.has(id) || !validIds.has(id));
-    const next = core.removeClassificationCategoryIds(
-      classification,
-      invalidIds,
-      validIds.has("other.todo") ? "other.todo" : ""
-    );
-    if (next !== classification) await db.putClassification(next);
+    if (!core.uniqueStrings(classification.categoryIds).some(id => removeIds.has(id) || !validIds.has(id))) continue;
+    await db.updateClassification(classification.bvid, (current) => {
+      if (!current) return;
+      const invalidIds = core.uniqueStrings(current.categoryIds)
+        .filter(id => removeIds.has(id) || !validIds.has(id));
+      const next = core.removeClassificationCategoryIds(current, invalidIds, validIds.has("other.todo") ? "other.todo" : "");
+      return next === current ? undefined : next;
+    });
   }
 }
 

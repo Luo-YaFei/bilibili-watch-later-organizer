@@ -30,12 +30,15 @@ function dashboard({ storage = new Map(), reduced = false, cards = [] } = {}) {
   vm.runInContext(source.replace("  init();", `
     globalThis.subject = {
       recordOperationLog, readOperationLogs, animateCardReflow, captureCardPositions,
-      removeFromWatchlater, updateState, updateStateWithSyncAnimation,
+      removeFromWatchlater, updateState, updateStateWithSyncAnimation, applySavedDetails, categoryCounts,
       shuffledVideos, shuffleVideos, visibleVideos, sortComboValue,
-      resumeResultTransition, resultCardPlan,
+      resumeResultTransition, resultCardPlan, nearestResultEdge,
       setResultTransition: (value) => { resultTransition = value; },
       setupCategoryLoop, wrapCategoryLoop, renderFeedbackNotice, updateStatusSurface, setStatus,
       captureModalDraft, renderEditor,
+      moveDirectoryCategory, directoryMoveTargets, categoryPanelGroups, ensureCategoryDraft,
+      overDirectoryDrop, directoryRowPlan, categoryBranchColumns,
+      prepareDirectoryDrag: (id, categories) => { directoryDraggedId = id; directoryDragTargets = directoryMoveTargets(categories, id); },
       openManagement: () => { managementOpen = true; manualEditorOpen = false; },
       openManual: (bvid) => { managementOpen = false; manualEditorOpen = true; selectedBvid = bvid; },
       appendCategoryLevel, renderCategoryTree, categoryAuraStyle,
@@ -49,7 +52,8 @@ function dashboard({ storage = new Map(), reduced = false, cards = [] } = {}) {
       getError: () => operationLogError,
       getState: () => state,
       setState: (next) => { state = Object.assign({}, state, next); },
-      setServices: (render, request) => { renderShell = render; send = request; }
+      setServices: (render, request) => { renderShell = render; send = request; },
+      setResultRenderer: (render) => { renderVideoResults = render; }
     };
   `), sandbox);
   return { ...sandbox.subject, sandbox, storage };
@@ -308,37 +312,51 @@ test("card reflow follows previous positions and cleans its interruption marker"
   assert.equal(card.dataset.reflow, undefined);
 });
 
-test("background redraw resumes result transitions without restarting and stops after expiry", () => {
+test("background redraw resumes card transitions without restarting and stops after expiry", async () => {
   const app = dashboard();
   let animation;
-  const card = { dataset: { bvid: "one" }, animate(frames, options) { animation = { frames, options }; return animation; } };
+  const card = { dataset: { bvid: "one" }, animate(frames, options) { animation = { frames, options, finished: Promise.resolve() }; return animation; } };
   const content = { querySelectorAll: () => [card], querySelector: () => null };
-  const cards = new Map([["one", { delay: 60, duration: 400, frames: [{ opacity: 0, transform: "translateY(18px) scale(.985)" }, { opacity: 1, transform: "translateY(0) scale(1)" }] }]]);
-  app.setResultTransition({ startedAt: Date.now() - 120, duration: 590, cards });
+  const cards = new Map([["one", { entering: true, delay: 24, duration: 420, frames: [{ opacity: 1, transform: "translate(-200px,0)" }, { opacity: 1, transform: "translate(0,0)" }] }]]);
+  app.setResultTransition({ startedAt: Date.now() - 120, duration: 588, cards });
   app.resumeResultTransition(content);
   assert.ok(animation.currentTime >= 120 && animation.currentTime < 360);
-  assert.equal(animation.frames[0].transform, "translateY(18px) scale(.985)");
-  assert.equal(animation.options.duration, 400);
+  assert.equal(animation.frames[0].transform, "translate(-200px,0)");
+  assert.equal(animation.options.duration, 420);
+  assert.equal(animation.options.delay, 24);
+  assert.equal(card.dataset.resultMotion, "edge");
+  await Promise.resolve();
+  assert.equal(card.dataset.resultMotion, undefined);
   animation = null;
-  app.setResultTransition({ startedAt: Date.now() - 700, duration: 590, cards });
+  app.setResultTransition({ startedAt: Date.now() - 700, duration: 588, cards });
   app.resumeResultTransition(content);
   assert.equal(animation, null);
   const reduced = dashboard({ reduced: true });
-  reduced.setResultTransition({ startedAt: Date.now(), duration: 590, cards });
+  reduced.setResultTransition({ startedAt: Date.now(), duration: 588, cards });
   reduced.resumeResultTransition(content);
   assert.equal(animation, null);
 });
 
-test("new, distant and previously offscreen videos enter locally; nearby shared videos retain position continuity", () => {
+test("nearby cards move from their current positions; distant and new cards enter from the nearest viewport edge without fading", () => {
   const app = dashboard();
-  const viewport = { top: 100, bottom: 800, width: 1000, height: 700 };
-  const after = { left: 40, top: 180, bottom: 430 };
-  assert.equal(app.resultCardPlan(undefined, after, viewport).entering, true);
-  assert.equal(app.resultCardPlan({ left: 40, top: -900, bottom: -650 }, after, viewport).entering, true);
-  assert.equal(app.resultCardPlan({ left: 900, top: 180, bottom: 430 }, after, viewport).entering, true);
-  const nearby = app.resultCardPlan({ left: 300, top: 150, bottom: 400 }, after, viewport);
-  assert.equal(nearby.entering, false);
-  assert.equal(nearby.frames[0].transform, "translate(260px, -30px)");
+  const viewport = { left: 200, right: 1200, top: 100, bottom: 900, width: 1000, height: 800 };
+  for (const [after, expected] of [
+    [{ left: 220, right: 380, top: 400, bottom: 600 }, "translate(-192px, 0px)"],
+    [{ left: 1000, right: 1160, top: 400, bottom: 600 }, "translate(212px, 0px)"],
+    [{ left: 600, right: 760, top: 120, bottom: 320 }, "translate(0px, -232px)"],
+    [{ left: 600, right: 760, top: 680, bottom: 880 }, "translate(0px, 232px)"]
+  ]) {
+    for (const before of [undefined, { left: -900, top: 200, bottom: 400 }, { left: 600, top: -900, bottom: -700 }]) {
+      const plan = app.resultCardPlan(before, after, viewport);
+      assert.equal(plan.entering, true);
+      assert.equal(plan.frames[0].transform, expected);
+      assert.equal(plan.frames[0].opacity, 1);
+    }
+    const before = { left: after.left + 30, top: after.top + 50, bottom: after.bottom + 50 };
+    const plan = app.resultCardPlan(before, after, viewport);
+    assert.equal(plan.entering, false);
+    assert.equal(plan.frames[0].transform, "translate(30px, 50px)");
+  }
 });
 
 test("reflow skips reduced motion, unmoved cards, new cards, and moves outside the viewport", () => {
@@ -384,6 +402,40 @@ test("successful deletion remains hidden through stale confirmation and later st
   assert.equal(app.getLogs().at(-1).kind, "success");
 });
 
+test("a verified re-add restores the card and a late removed snapshot cannot hide it again", async () => {
+  const app = dashboard();
+  const bvid = "BV1Yz411B7n3";
+  const snapshot = (revision, presentInWatchlater) => ({
+    videos: [{ bvid, watchlaterMembershipRevision: revision, presentInWatchlater }]
+  });
+  app.setState(snapshot(1, true));
+  const removed = snapshot(2, false);
+  app.setServices(() => {}, async () => ({ ...removed, removeResult: { watchlaterMembershipRevision: 2 } }));
+  await app.removeFromWatchlater(bvid);
+  app.updateState(snapshot(1, true));
+  assert.equal(app.getState().videos[0].presentInWatchlater, false);
+  await app.updateStateWithSyncAnimation(snapshot(3, true), {});
+  assert.equal(app.getState().videos[0].presentInWatchlater, true);
+  assert.deepEqual([...app.getAdded()], [bvid]);
+  await app.updateStateWithSyncAnimation(removed, { removedBvids: [bvid] });
+  assert.equal(app.getState().videos[0].presentInWatchlater, true);
+});
+
+test("re-add evidence arriving before a delayed delete reply is retained", async () => {
+  const app = dashboard();
+  const bvid = "BV1Yz411B7n3";
+  app.setState({ videos: [{ bvid, watchlaterMembershipRevision: 1, presentInWatchlater: true }] });
+  let resolveRemoval;
+  app.setServices(() => {}, () => new Promise(resolve => { resolveRemoval = resolve; }));
+  const deleting = app.removeFromWatchlater(bvid);
+  app.updateState({ videos: [{ bvid, watchlaterMembershipRevision: 3, presentInWatchlater: true }] });
+  assert.equal(app.getState().videos[0].presentInWatchlater, false);
+  resolveRemoval({ videos: [{ bvid, watchlaterMembershipRevision: 2, presentInWatchlater: false }],
+    removeResult: { watchlaterMembershipRevision: 2 } });
+  await deleting;
+  assert.equal(app.getState().videos[0].presentInWatchlater, true);
+});
+
 test("loading videos does not select one; refresh preserves only an explicit valid selection", () => {
   const app = dashboard();
   app.setServices(() => {}, async () => ({}));
@@ -395,6 +447,28 @@ test("loading videos does not select one; refresh preserves only an explicit val
   assert.equal(app.getSelection(), "two");
   app.updateState({ videos: [{ bvid: "one" }] });
   assert.equal(app.getSelection(), "");
+});
+
+test("saved detail updates survive stale snapshots without restoring a removed video", () => {
+  const app = dashboard();
+  const video = { bvid: "BV1Yz411B7n3", title: "旧标题", presentInWatchlater: true, lastSeenAt: 5, watchlaterMembershipRevision: 1 };
+  app.setState({ videos: [video] });
+  app.setServices(() => {}, () => assert.fail("detail updates should not request state again"));
+  app.applySavedDetails([{ ...video, lastSeenAt: 8, title: "新标题" }]);
+  app.updateState({ videos: [video] });
+  assert.equal(app.getState().videos[0].title, "新标题");
+  app.updateState({ videos: [{ ...video, watchlaterMembershipRevision: 2, presentInWatchlater: false }] });
+  assert.equal(app.getState().videos[0].presentInWatchlater, false);
+});
+
+test("a video in two child categories counts once in their parent", () => {
+  const app = dashboard();
+  app.setState({
+    categories: [{ id: "root" }, { id: "first", parentId: "root" }, { id: "second", parentId: "root" }],
+    videos: [{ bvid: "one" }],
+    classifications: [{ bvid: "one", categoryIds: ["root", "first", "second"], sourceType: "manual" }]
+  });
+  assert.equal(app.categoryCounts().byCategory.get("root"), 1);
 });
 
 test("sync animates new and returning videos and reflows existing cards without selecting a video", async () => {
@@ -425,6 +499,8 @@ test("shuffle preserves all videos without mutating input and changes an unchang
 test("random order survives refresh and never selects a video", () => {
   const app = dashboard();
   const renders = [];
+  const resultRenders = [];
+  app.setResultRenderer(reason => resultRenders.push(reason));
   app.setServices((options) => renders.push(options), async () => ({}));
   const videos = ["a", "b", "c", "d"].map((bvid, watchlaterOrder) => ({ bvid, watchlaterOrder }));
   app.setState({ videos });
@@ -432,8 +508,8 @@ test("random order survives refresh and never selects a video", () => {
   const order = [...app.visibleVideos()].map((video) => video.bvid);
   assert.notDeepEqual(order, ["a", "b", "c", "d"]);
   assert.equal(new Set(order).size, 4);
-  assert.equal(renders.at(-1).animateCards, true);
-  assert.equal(renders.at(-1).reflowDuration, 480);
+  assert.deepEqual(resultRenders, ["sort"]);
+  assert.equal(renders.length, 0, "sorting must not rebuild the shell");
   app.updateState({ videos: [...videos].reverse() });
   assert.deepEqual([...app.visibleVideos()].map((video) => video.bvid), order);
   assert.equal(app.getSelection(), "");
@@ -463,7 +539,7 @@ test("feedback expires, stays hidden across redraws and restarts for the latest 
   assert.equal(surface.hidden, true);
 });
 
-test("settings explain three destinations and manual drafts survive a background redraw", () => {
+test("settings expose all destinations and manual drafts survive a background redraw", () => {
   const app = dashboard();
   app.sandbox.document.createElement = tag => ({
     tag, dataset: {}, children: [], attributes: {},
@@ -478,7 +554,7 @@ test("settings explain three destinations and manual drafts survive a background
   const dialog = app.renderEditor().children[0];
   assert.equal(dialog.tag, "dialog");
   const nav = dialog.children[1].children[0].children[0];
-  assert.deepEqual(Array.from(nav.children, node => node.dataset.page), ["classify", "directory", "preferences"]);
+  assert.deepEqual(Array.from(nav.children, node => node.dataset.page), ["classify", "directory", "preferences", "general", "tools", "logs"]);
   app.openManual(video.bvid);
   app.sandbox.document.querySelector = selector => selector === ".management-dialog" ? {
     querySelector: () => ({}), querySelectorAll: () => [{ value: "math" }]
@@ -487,6 +563,119 @@ test("settings explain three destinations and manual drafts survive a background
   const manual = app.renderEditor().children[0];
   const fold = manual.children[1].children[0];
   const choices = fold.children[0].children.find(node => node.className?.includes("manual-category-list"));
-  const checked = choices.children.map(row => row.children[0]).filter(input => input.checked);
+  const checked = choices.children.flatMap(panel => panel.children.map(row => row.children[0])).filter(input => input.checked);
   assert.deepEqual(Array.from(checked, input => input.value), ["math"]);
+});
+
+test("directory moves retain subtrees, persist sibling order, promote roots and reject cycles", () => {
+  const app = dashboard();
+  const categories = [
+    { id: "a", name: "A", order: 10 }, { id: "b", name: "B", order: 20 },
+    { id: "x", name: "X", parentId: "a", order: 10 },
+    { id: "y", name: "Y", parentId: "a", order: 20 },
+    { id: "leaf", name: "Leaf", parentId: "x", order: 10 }
+  ];
+  const siblings = parent => Array.from(app.sandbox.BiliWLCore.childrenOf(categories, parent), item => item.id);
+  assert.equal(app.moveDirectoryCategory(categories, "y", "a", "x"), true);
+  assert.deepEqual(siblings("a"), ["y", "x"]);
+  assert.equal(app.moveDirectoryCategory(categories, "x", "b"), true);
+  assert.equal(categories.find(item => item.id === "leaf").parentId, "x");
+  assert.deepEqual(siblings("b"), ["x"]);
+  assert.equal(app.moveDirectoryCategory(categories, "x", "", "a"), true);
+  assert.deepEqual(siblings(""), ["x", "a", "b"]);
+  const snapshot = JSON.stringify(categories);
+  assert.equal(app.moveDirectoryCategory(categories, "x", "leaf"), false);
+  assert.equal(app.moveDirectoryCategory(categories, "x", "x"), false);
+  assert.equal(app.moveDirectoryCategory(categories, "x", "missing"), false);
+  assert.equal(JSON.stringify(categories), snapshot);
+  const groups = app.categoryPanelGroups(categories);
+  assert.deepEqual(Array.from(groups, rows => Array.from(rows, row => row.category.id)), [["x", "leaf"], ["a", "y"], ["b"]]);
+  assert.deepEqual(Array.from(groups[0], row => row.level), [0, 1]);
+});
+
+test("directory drops on third-level categories select their parent and keep subtrees within three levels", () => {
+  const app = dashboard();
+  const categories = [
+    { id: "root", name: "Root" }, { id: "second", name: "Second", parentId: "root" },
+    { id: "third", name: "Third", parentId: "second" },
+    { id: "leaf", name: "Leaf" }, { id: "branch", name: "Branch" },
+    { id: "child", name: "Child", parentId: "branch" }
+  ];
+  assert.equal(app.directoryMoveTargets(categories, "leaf").get("third"), "second");
+  assert.equal(app.moveDirectoryCategory(categories, "leaf", "third"), true);
+  assert.equal(categories.find(c => c.id === "leaf").parentId, "second");
+  assert.equal(app.moveDirectoryCategory(categories, "branch", "third"), true);
+  assert.equal(categories.find(c => c.id === "branch").parentId, "root");
+  assert.equal(categories.find(c => c.id === "child").parentId, "branch");
+  assert.ok(app.categoryPanelGroups(categories).every(rows => rows.every(row => row.level <= 2)));
+});
+
+test("existing deep branches are lifted only in the directory draft without changing category IDs", () => {
+  const app = dashboard();
+  const categories = [
+    { id: "a", name: "A" }, { id: "b", name: "B", parentId: "a" },
+    { id: "c", name: "C", parentId: "b" }, { id: "d", name: "D", parentId: "c" }
+  ];
+  app.setState({ categories });
+  const draft = app.ensureCategoryDraft();
+  assert.equal(draft.find(c => c.id === "d").parentId, "b");
+  assert.equal(categories.find(c => c.id === "d").parentId, "c");
+  assert.deepEqual(Array.from(draft, c => c.id), categories.map(c => c.id));
+  assert.ok(app.categoryPanelGroups(draft).every(rows => rows.every(row => row.level <= 2)));
+});
+
+test("repeated directory dragover uses cached targets and changes only the previous and next highlight", () => {
+  const app = dashboard();
+  const categories = [{ id: "source", name: "Source" }, ...Array.from({ length: 200 }, (_, i) => ({ id: "target-" + i, name: "Target " + i }))];
+  app.prepareDirectoryDrag("source", categories);
+  let adds = 0, removes = 0, accepted = 0;
+  const zones = categories.slice(1).map(category => ({
+    dataset: { parentId: category.id, beforeId: "" },
+    classList: { add() { adds++; }, remove() { removes++; } }
+  }));
+  for (const zone of zones) {
+    const event = { target: { closest: () => zone }, dataTransfer: {}, preventDefault() { accepted++; } };
+    for (let i = 0; i < 50; i++) app.overDirectoryDrop(event);
+    assert.equal(event.dataTransfer.dropEffect, "move");
+  }
+  assert.equal(accepted, 10000);
+  assert.equal(adds, 200);
+  assert.equal(removes, 199);
+});
+
+
+test("wide category columns keep each second-level branch intact", () => {
+  const app = dashboard();
+  const rows = [{ level: 0, category: { id: "root" } },
+    ...[1, 2, 2, 1, 2, 1].map((level, i) => ({ level, category: { id: String(i) } }))];
+  const columns = app.categoryBranchColumns(rows);
+  assert.deepEqual(Array.from(columns, branches => Array.from(branches, branch => Array.from(branch, row => row.category.id))),
+    [[["0", "1", "2"]], [["3", "4"], ["5"]]]);
+});
+
+test("directory rows accept broad sibling areas and only parent centers accept children", () => {
+  const app = dashboard();
+  const targets = new Map([["root", "root"], ["second", "second"], ["third", "second"], ["", ""]]);
+  const info = { id: "third", parentId: "second", nextId: "next", level: 2, node: {} };
+  const plan = (fraction, previous) => app.directoryRowPlan(info, fraction, targets, previous);
+  for (const fraction of [-.2, .1, .4]) {
+    assert.equal(plan(fraction).mode, "before");
+    assert.equal(plan(fraction).beforeId, "third");
+    assert.equal(plan(fraction).parentId, "second");
+  }
+  for (const fraction of [.6, .9, 1.2]) {
+    assert.equal(plan(fraction).mode, "after");
+    assert.equal(plan(fraction).beforeId, "next");
+  }
+  assert.equal(plan(.52, "before").mode, "before");
+  assert.equal(plan(.48, "after").mode, "after");
+  info.id = "second"; info.parentId = "root"; info.level = 1;
+  assert.equal(plan(.5).mode, "inside");
+  assert.equal(plan(.5).parentId, "second");
+  assert.equal(plan(.1).mode, "before");
+  assert.equal(plan(.9).mode, "after");
+  assert.equal(plan(.2, "inside").mode, "inside");
+  info.level = 0; info.id = "root"; info.parentId = "";
+  assert.equal(plan(.5).parentId, "root");
+  assert.equal(plan(.1).parentId, "");
 });

@@ -23,7 +23,7 @@
 
   function openDB() {
     if (dbPromise) return dbPromise;
-    dbPromise = new Promise((resolve, reject) => {
+    const attempt = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
       request.onupgradeneeded = () => {
         const db = request.result;
@@ -48,10 +48,27 @@
           db.createObjectStore("meta", { keyPath: "key" });
         }
       };
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        const db = request.result;
+        if (dbPromise !== attempt) {
+          db.close();
+          return;
+        }
+        const clearConnection = () => {
+          if (dbPromise === attempt) dbPromise = null;
+        };
+        db.onclose = clearConnection;
+        db.onversionchange = () => { clearConnection(); db.close(); };
+        resolve(db);
+      };
       request.onerror = () => reject(request.error || new Error("Cannot open IndexedDB"));
+      request.onblocked = () => reject(new Error("本地数据库正在被其他页面使用，请关闭旧的整理页后重试"));
     });
-    return dbPromise;
+    dbPromise = attempt;
+    attempt.catch(() => {
+      if (dbPromise === attempt) dbPromise = null;
+    });
+    return attempt;
   }
 
   async function get(storeName, key) {
@@ -89,46 +106,82 @@
   }
 
   async function upsertVideos(items, options) {
+    const db = await openDB();
+    const tx = db.transaction("videos", "readwrite");
+    const done = txDone(tx);
+    const store = tx.objectStore("videos");
     const results = [];
     const errors = [];
+    const mergedByBvid = new Map();
     for (const item of items || []) {
       try {
         const bvid = core.normalizeBvid(item && (item.bvid || item.pageUrl));
         if (!bvid) continue;
-        const existing = await get("videos", bvid);
-        const merged = core.canonicalizeVideo(item, existing, options);
-        await put("videos", merged);
-        results.push({ video: merged, isNew: !existing, sourceChanged: existing && existing.sourceHash !== merged.sourceHash });
+        const request = store.get(bvid);
+        request.onsuccess = () => {
+          try {
+            // Duplicate IDs in a batch must see the preceding merge.
+            const existing = mergedByBvid.get(bvid) || request.result;
+            const merged = core.canonicalizeVideo(item, existing, options);
+            store.put(merged);
+            mergedByBvid.set(bvid, merged);
+            results.push({ video: merged, isNew: !existing, sourceChanged: existing && existing.sourceHash !== merged.sourceHash });
+          } catch (error) {
+            errors.push(error && error.message ? error.message : String(error));
+          }
+        };
       } catch (error) {
         errors.push(error && error.message ? error.message : String(error));
       }
     }
+    // A disk/quota failure aborts the transaction and rejects the whole batch.
+    await done;
     return { results, errors };
   }
 
-  async function markRemovedExcept(presentBvids) {
+  async function markRemovedExcept(presentBvids, unidentifiedAids) {
     const present = new Set(presentBvids || []);
-    const videos = await getAll("videos");
+    const unresolved = new Set(unidentifiedAids || []);
+    const db = await openDB();
+    const tx = db.transaction("videos", "readwrite");
+    const done = txDone(tx);
     const removed = [];
-    for (const video of videos) {
-      if (video.presentInWatchlater !== false && !present.has(video.bvid)) {
-        video.presentInWatchlater = false;
+    const request = tx.objectStore("videos").openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      const video = cursor.value;
+      const aid = Number(video.aid || video.oid);
+      const mightBeUnidentified = unresolved.size && (!aid || unresolved.has(aid));
+      if (video.presentInWatchlater !== false && !present.has(video.bvid) && !mightBeUnidentified) {
+        core.setAuthoritativeWatchlaterMembership(video, false);
         video.lastSeenAt = Date.now();
-        await put("videos", video);
+        cursor.update(video);
         removed.push(video.bvid);
       }
-    }
+      cursor.continue();
+    };
+    await done;
     return removed;
   }
 
   async function markRemoved(bvid) {
     const normalized = core.normalizeBvid(bvid);
     if (!normalized) return null;
-    const video = await get("videos", normalized);
-    if (!video) return null;
-    video.presentInWatchlater = false;
-    video.lastSeenAt = Date.now();
-    await put("videos", video);
+    const db = await openDB();
+    const tx = db.transaction("videos", "readwrite");
+    const done = txDone(tx);
+    const store = tx.objectStore("videos");
+    let video = null;
+    const request = store.get(normalized);
+    request.onsuccess = () => {
+      if (!request.result) return;
+      video = request.result;
+      core.setAuthoritativeWatchlaterMembership(video, false);
+      video.lastSeenAt = Date.now();
+      store.put(video);
+    };
+    await done;
     return video;
   }
 
@@ -140,27 +193,59 @@
     return get("classifications", bvid);
   }
 
+  async function updateClassification(bvid, update) {
+    const db = await openDB();
+    const tx = db.transaction("classifications", "readwrite");
+    const done = txDone(tx);
+    const store = tx.objectStore("classifications");
+    let next, updateError;
+    const request = store.get(bvid);
+    request.onsuccess = () => {
+      try {
+        next = update(request.result);
+        if (next === null) store.delete(bvid);
+        else if (next !== undefined) store.put(next);
+      } catch (error) {
+        updateError = error;
+        tx.abort();
+      }
+    };
+    try {
+      await done;
+    } catch (error) {
+      throw updateError || error;
+    }
+    return next;
+  }
+
   async function queueJobs(type, bvids, reason) {
+    const db = await openDB();
+    const tx = db.transaction("jobs", "readwrite");
+    const done = txDone(tx);
+    const store = tx.objectStore("jobs");
     const now = Date.now();
     let queued = 0;
-    for (const bvid of new Set(bvids || [])) {
-      const normalized = core.normalizeBvid(bvid);
+    for (const normalized of new Set((bvids || []).map(bvid => core.normalizeBvid(bvid)))) {
       if (!normalized) continue;
       const id = type + ":" + normalized;
-      const existing = await get("jobs", id);
-      if (existing && (existing.status === "pending" || existing.status === "running")) continue;
-      await put("jobs", {
-        id,
-        type,
-        bvid: normalized,
-        reason: reason || "",
-        status: "pending",
-        attempts: existing && existing.attempts ? existing.attempts : 0,
-        createdAt: existing && existing.createdAt ? existing.createdAt : now,
-        updatedAt: now
-      });
-      queued += 1;
+      const request = store.get(id);
+      request.onsuccess = () => {
+        const existing = request.result;
+        if (existing && (existing.status === "pending" || existing.status === "running")) return;
+        store.put({
+          id,
+          type,
+          bvid: normalized,
+          reason: reason || "",
+          status: "pending",
+          attempts: existing && existing.attempts ? existing.attempts : 0,
+          createdAt: existing && existing.createdAt ? existing.createdAt : now,
+          updatedAt: now
+        });
+        queued += 1;
+      };
     }
+    await done;
     return queued;
   }
 
@@ -173,17 +258,45 @@
   }
 
   async function pendingJobs(type) {
-    const jobs = await getAll("jobs");
+    const db = await openDB();
+    const tx = db.transaction("jobs", "readonly");
+    const index = tx.objectStore("jobs").index("status");
+    // Old versions could leave a job marked running when the worker stopped.
+    const [pending, running] = await Promise.all(["pending", "running"].map(status =>
+      requestToPromise(index.getAll(status))));
+    const jobs = pending.concat(running);
     return jobs
-      .filter((job) => job.type === type && job.status === "pending")
+      .filter((job) => job.type === type)
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   }
 
-  async function summary() {
-    const videos = await getAll("videos");
-    const classifications = await getAll("classifications");
-    const jobs = await getAll("jobs");
-    return { videos, classifications, jobs };
+  async function removeJobsExcept(type) {
+    const db = await openDB();
+    const tx = db.transaction("jobs", "readwrite");
+    const done = txDone(tx);
+    const request = tx.objectStore("jobs").openCursor();
+    let removed = 0;
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      if (cursor.value.type !== type) {
+        cursor.delete();
+        removed++;
+      }
+      cursor.continue();
+    };
+    await done;
+    return removed;
+  }
+
+  async function summary({ includeJobs = true } = {}) {
+    const db = await openDB();
+    const stores = includeJobs ? ["videos", "classifications", "jobs"] : ["videos", "classifications"];
+    const tx = db.transaction(stores, "readonly");
+    const [videos, classifications, jobs] = await Promise.all(
+      stores.map(name => requestToPromise(tx.objectStore(name).getAll()))
+    );
+    return includeJobs ? { videos, classifications, jobs } : { videos, classifications };
   }
 
   root.BiliWLDB = Object.freeze({
@@ -200,9 +313,11 @@
     markRemoved,
     putClassification,
     getClassification,
+    updateClassification,
     queueJobs,
     updateJob,
     pendingJobs,
+    removeJobsExcept,
     summary
   });
 })(typeof globalThis !== "undefined" ? globalThis : window);

@@ -192,8 +192,11 @@
     syncInFlight = true;
     try {
       setStatus(options.fullScan ? "正在扫描列表..." : "正在同步可见视频...");
-      const response = await send({ type: message.SCAN_WATCHLATER, domItems });
+      const response = await send({ type: message.SCAN_WATCHLATER, domItems, lightSync: !options.fullScan });
       updateState(response);
+      if (response.apiError) setStatus("列表同步失败，已保留本地列表：" + response.apiError);
+    } catch (error) {
+      setStatus("列表同步失败：" + error.message);
     } finally {
       syncInFlight = false;
     }
